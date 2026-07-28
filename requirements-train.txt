@@ -1,0 +1,14 @@
+# STT training + inference deps (Weeks 3-4). Install on top of requirements.txt:
+#   pip install -r requirements.txt -r requirements-train.txt
+# On Apple Silicon the standard wheels ship the MPS backend — no extra CUDA setup.
+torch>=2.2
+torchaudio>=2.2
+transformers>=4.44
+peft>=0.11
+datasets>=2.20
+accelerate>=0.30
+soundfile>=0.12
+
+# Optional: faster STT eval/serving on Apple Silicon
+# mlx-whisper
+# ctranslate2

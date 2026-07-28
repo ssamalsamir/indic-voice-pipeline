@@ -1,0 +1,56 @@
+# Hindi STT — the first end-to-end run (Weeks 3-4).
+# Kathbath is clean read speech with many speakers: a forgiving STT start.
+run:
+  name: hi_stt_kathbath
+  track: stt
+  language: hi
+  seed: 1337
+
+data:
+  dataset: kathbath
+  hf_path: ai4bharat/Kathbath
+  licence: CC-BY-4.0
+  train_split: train
+  eval_split: valid
+  max_train_utts: 2000        # small first pass; raise once the spine is proven
+
+ingest:
+  target_sr: 16000
+  mono: true
+
+clean:
+  canonical_script: Devanagari
+  trim_silence: true
+  min_duration_s: 0.6
+  max_duration_s: 20.0
+  normalise_numerals: true
+  keep_code_mixing: true      # Hindi ASR must handle embedded English
+
+align:
+  aligner: none               # Kathbath is already utterance-level
+  min_score: 0.5
+
+train:
+  base_model: whisper-small   # MPS-feasible; -> indicwhisper on stronger HW
+  device: mps
+  precision: fp32
+  lora:
+    enabled: true
+    r: 16
+    alpha: 32
+  epochs: 3
+  lr: 1.0e-4
+  batch_size: 8
+  grad_accum: 2
+
+eval:
+  metrics: [wer, cer]
+  slices: [domain, is_code_mixed]
+  thresholds:                 # agreed w/ mentor 2026-07-21: ~90% accuracy (soft target)
+    wer: 0.10                  # 90% word accuracy target; pipeline robustness is the priority
+    cer: 0.08
+
+package:
+  quantise: true
+  serve_format: ctranslate2   # fast Whisper on-prem
+  rtf_target: 1.0

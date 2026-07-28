@@ -1,0 +1,56 @@
+# Hindi TTS — one voice (Weeks 5-6). Reuses the SAME spine as the STT run.
+# voice_id set => the config validator REQUIRES a consent record (governance gate).
+run:
+  name: hi_tts_indicvoices
+  track: tts
+  language: hi
+  seed: 1337
+
+data:
+  dataset: indicvoices
+  hf_path: ai4bharat/IndicVoices
+  licence: CC-BY-4.0
+  consent: "Speaker consented to voice modelling — IndicVoices release terms, 2024."
+  train_split: train
+  eval_split: test
+  max_train_utts: 1500
+
+ingest:
+  target_sr: 22050            # TTS wants higher fidelity than 16k ASR
+  mono: true
+
+clean:
+  canonical_script: Devanagari
+  trim_silence: true
+  min_duration_s: 1.0
+  max_duration_s: 15.0
+  normalise_numerals: true    # numbers expand to words for TTS (clean stage handles it)
+  keep_code_mixing: true
+
+align:
+  aligner: whisperx           # TTS needs tight (text,audio) alignment
+  min_score: 0.6
+
+train:
+  base_model: vits-hi         # small, low-latency default; -> indic-parler for quality
+  device: mps
+  precision: fp32
+  lora:
+    enabled: true
+  voice_id: speaker_hi_f1
+  epochs: 200                 # TTS trains for more steps on less data
+  lr: 2.0e-4
+  batch_size: 16
+
+eval:
+  metrics: [asr_wer, mcd]     # intelligibility (synthesise->transcribe) + spectral dist
+  slices: [is_code_mixed]
+  thresholds:                 # mentor: "not robotic, natural sounding" — no hard number
+    mos: 3.5                  # small informal 3-5 listener panel; >=3.5/5 = clearly natural
+    asr_wer: 0.25             # intelligibility proxy (synthesise -> transcribe back)
+    mcd: 6.0
+
+package:
+  quantise: true
+  serve_format: onnx
+  rtf_target: 0.5             # TTS must be well under real-time to be usable

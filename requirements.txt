@@ -1,0 +1,25 @@
+# Spine (always needed) — pure/light, runs anywhere incl. Apple Silicon
+pydantic>=2.6
+pyyaml>=6.0
+
+# Data + training (Weeks 3-6) — install when you start the model tracks
+# torch>=2.2            # MPS backend ships in the standard macOS wheel
+# torchaudio>=2.2
+# transformers>=4.44
+# peft>=0.11
+# datasets>=2.20
+# accelerate>=0.30
+
+# Inference / eval helpers (fast on Apple Silicon)
+# mlx-whisper           # quick STT eval on MPS
+# ctranslate2           # on-prem Whisper serving/export
+
+# Alignment (Week 1-2, pick one)
+# whisperx
+# ctc-segmentation
+
+# Indic text (upgrade the normaliser/G2P beyond the built-in stubs)
+# indic-nlp-library
+
+# Dev
+pytest>=8.0

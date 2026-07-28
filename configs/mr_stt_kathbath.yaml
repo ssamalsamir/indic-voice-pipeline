@@ -1,0 +1,56 @@
+# Week-8 REUSE PROOF (acceptance #9): a new language via CONFIG + DATA ONLY.
+# Diff this against hi_stt_kathbath.yaml — only language/data/name change. No code edits.
+run:
+  name: mr_stt_kathbath
+  track: stt
+  language: mr                # Marathi
+  seed: 1337
+
+data:
+  dataset: kathbath
+  hf_path: ai4bharat/Kathbath
+  licence: CC-BY-4.0
+  train_split: train
+  eval_split: valid
+  max_train_utts: 2000
+
+ingest:
+  target_sr: 16000
+  mono: true
+
+clean:
+  canonical_script: Devanagari  # Marathi also uses Devanagari — normaliser is shared
+  trim_silence: true
+  min_duration_s: 0.6
+  max_duration_s: 20.0
+  normalise_numerals: true
+  keep_code_mixing: true
+
+align:
+  aligner: none
+  min_score: 0.5
+
+train:
+  base_model: whisper-small
+  device: mps
+  precision: fp32
+  lora:
+    enabled: true
+    r: 16
+    alpha: 32
+  epochs: 3
+  lr: 1.0e-4
+  batch_size: 8
+  grad_accum: 2
+
+eval:
+  metrics: [wer, cer]
+  slices: [domain, is_code_mixed]
+  thresholds:                 # same soft target as Hindi (mentor: ~90% accuracy)
+    wer: 0.10
+    cer: 0.08
+
+package:
+  quantise: true
+  serve_format: ctranslate2
+  rtf_target: 1.0

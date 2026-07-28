@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+runs/
+data/*/
+
+# Training / eval logs (regenerated per run; RUN_STATUS.md carries the summary)
+*.log
+
+model_cards/*.md
+reports/*
+*.wav
+*.flac
+.DS_Store
+
+# Tooling caches
+.impeccable/

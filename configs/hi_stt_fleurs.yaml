@@ -1,0 +1,61 @@
+# Hindi STT on FLEURS — the dataset that runs today: open (CC-BY-4.0), no auth/gating,
+# clean read speech, small. First real end-to-end training run on Apple Silicon.
+run:
+  name: hi_stt_fleurs
+  track: stt
+  language: hi
+  seed: 1337
+
+data:
+  dataset: fleurs
+  hf_path: google/fleurs
+  hf_config: hi_in            # FLEURS uses '<lang>_<region>' config names, not bare 'hi'
+  licence: CC-BY-4.0
+  # Use the small validation archive for BOTH: train = validation[0:200],
+  # eval = validation[200:250] (disjoint, honest held-out, one cached download).
+  # FLEURS 'train' is a much larger tar; switch to it once throughput allows.
+  train_split: train          # scale-up: real FLEURS train split (~2k utts), disjoint from validation
+  eval_split: validation      # held-out = validation[0:50] (train/eval now different splits)
+  max_train_utts: 1500
+
+ingest:
+  target_sr: 16000
+  mono: true
+
+clean:
+  canonical_script: Devanagari
+  trim_silence: false         # FLEURS is already clean studio-style read speech
+  min_duration_s: 0.5
+  max_duration_s: 30.0
+  normalise_numerals: true
+  keep_code_mixing: true
+
+align:
+  aligner: none               # FLEURS is utterance-level already
+
+train:
+  base_model: whisper-medium  # ungated 769M; Indic-tuned indicwhisper is gated (needs HF_TOKEN)
+  device: mps
+  precision: fp32             # bf16 measured WORSE on MPS (run8): 0 steps in 10 min, 8.3GB
+                              # swap, process stuck in page-in wait. Autocast adds casts, not
+                              # savings. Don't retry bf16 on this hardware.
+  lora:
+    enabled: true
+    r: 16
+    alpha: 32
+  epochs: 4
+  lr: 1.0e-4
+  batch_size: 1               # 16GB M4: batch=1 keeps peak fp32 activations off swap
+  grad_accum: 8               # effective batch stays 8; memory footprint ~4x lower
+
+eval:
+  metrics: [wer, cer]
+  slices: [is_code_mixed]
+  thresholds:                 # mentor: ~90% accuracy soft target
+    wer: 0.10
+    cer: 0.08
+
+package:
+  quantise: false
+  serve_format: torch
+  rtf_target: 1.0
