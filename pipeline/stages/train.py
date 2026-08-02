@@ -17,6 +17,13 @@ from pipeline.registry import get_base_model
 from pipeline.stages.base import Stage
 from pipeline.utils.io import dump_json
 
+# Checkpoint AND evaluate on this cadence — load_best_model_at_end requires both to
+# fire on the same steps, so one constant drives both.
+_CKPT_STEPS = 150
+# Enough held-back rows for eval_loss to be a usable signal, few enough that we aren't
+# throwing away training data we can't spare.
+_HOLDOUT_FRACTION = 0.05
+
 
 class TrainStage(Stage):
     name = "train"
@@ -98,6 +105,18 @@ class TrainStage(Stage):
                                   if not tc.lora.enabled
                                   else model.base_model.config.decoder_start_token_id)
 
+        # Hold a slice back purely as an early-stopping signal. With a few thousand
+        # utterances and several epochs the FINAL step is often past the overfitting
+        # point, so without this we ship whichever weights step N happened to land on.
+        # Not the eval set — that's a different split entirely, scored in stage 5.
+        holdout = max(1, round(len(dataset) * _HOLDOUT_FRACTION))
+        train_ds, dev_ds = torch.utils.data.random_split(
+            dataset, [len(dataset) - holdout, holdout],
+            generator=torch.Generator().manual_seed(self.cfg.run.seed),
+        )
+        self.log.info("train=%d dev=%d (dev is for checkpoint selection only)",
+                      len(train_ds), len(dev_ds))
+
         args = Seq2SeqTrainingArguments(
             output_dir=str(self.out_path),
             per_device_train_batch_size=tc.batch_size,
@@ -105,10 +124,12 @@ class TrainStage(Stage):
             learning_rate=tc.lr,
             warmup_ratio=tc.warmup_ratio,
             num_train_epochs=tc.epochs,
-            # MPS is unstable in fp16, so fp16 stays off regardless of config.
-            # bf16 (autocast, fp32 master weights) is opt-in via `train.precision: bf16`
-            # — halves activation memory, which is what keeps whisper-medium off swap.
-            fp16=False, bf16=(tc.precision == "bf16"),
+            # MPS is unstable in fp16 and measurably worse in bf16 (see the config
+            # comment), so on MPS this stays fp32 whatever the config says. On CUDA
+            # both are safe and fp16 is the point: it halves memory, which is what
+            # makes whisper-large-v3 fit on a single A10G/A100.
+            fp16=(tc.precision == "fp16" and tc.device == "cuda"),
+            bf16=(tc.precision == "bf16" and tc.device == "cuda"),
             # 16GB M4 + whisper-medium fp32 is swap-bound, not compute-bound: stored
             # activations page to disk and steps blow out to minutes. Recomputing them
             # costs ~30% more compute and buys back most of that memory.
@@ -117,15 +138,23 @@ class TrainStage(Stage):
             gradient_checkpointing_kwargs={"use_reentrant": False},
             logging_steps=25,
             save_strategy="steps",              # insurance: periodic checkpoints so a long
-            save_steps=150,                     # MPS run can't lose everything if interrupted
-            save_total_limit=1,                 # keep only the newest (disk-friendly)
+            save_steps=_CKPT_STEPS,             # MPS run can't lose everything if interrupted
+            # load_best_model_at_end requires eval and save to land on the same steps.
+            eval_strategy="steps",
+            eval_steps=_CKPT_STEPS,
+            per_device_eval_batch_size=tc.batch_size,
+            load_best_model_at_end=True,
+            metric_for_best_model="eval_loss",
+            greater_is_better=False,
+            save_total_limit=2,                 # best + newest; HF protects the best one
             remove_unused_columns=False,        # our dataset yields custom keys
             label_names=["labels"],
             report_to=[],
             seed=self.cfg.run.seed,
         )
         trainer = Seq2SeqTrainer(
-            model=model, args=args, train_dataset=dataset, data_collator=collator,
+            model=model, args=args, train_dataset=train_ds, eval_dataset=dev_ds,
+            data_collator=collator,
             processing_class=processor.feature_extractor,
             callbacks=[MPSCacheCallback()],
         )

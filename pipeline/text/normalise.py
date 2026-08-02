@@ -92,3 +92,43 @@ def normalise(
 
     # 7. Collapse whitespace.
     return _WS.sub(" ", text).strip()
+
+
+# -- scoring-only normalisation ------------------------------------------------
+#
+# Deliberately NOT part of normalise(): the corpus keeps its punctuation and
+# orthographic detail so the model learns to emit them. This second pass exists
+# only to stop WER punishing differences no listener would call a mistake, and it
+# is applied identically to reference and hypothesis, which is what keeps it
+# honest rather than metric-gaming.
+
+# Nukta is written inconsistently across Hindi corpora (क़/क, ज़/ज, फ़/फ). NFC leaves
+# it as a combining mark (U+0958..U+095F are composition-excluded), so dropping the
+# mark folds every spelling of the pair together.
+_NUKTA = "़"
+
+# Chandrabindu vs anusvara is a scribal choice, not a pronunciation difference.
+_CHANDRABINDU, _ANUSVARA = "ँ", "ं"
+
+# संभव vs सम्भव: a nasal + virama before another consonant is the conjunct spelling
+# of the same sound anusvara writes. Fold the conjunct form INTO anusvara so both
+# spellings collide. Restricted to the five nasals so unrelated conjuncts survive.
+_CONJUNCT_NASAL = re.compile(r"[ङञणनम]्(?=[क-ह])")
+
+# Punctuation carries no spoken content, and Whisper emits it inconsistently.
+_PUNCT_STRIP = re.compile(r"[.,!?;:\"'()\[\]{}<>/\\|`~@#$%^&*_+=–—।॥-]")
+
+
+def normalise_for_scoring(text: str, **kwargs) -> str:
+    """Fold away differences WER should not punish, then defer to `normalise`.
+
+    Order matters: `normalise` runs first so its NFC pass has already decomposed the
+    precomposed nukta letters into base + mark, which is what makes stripping the
+    mark a single deletion rather than a per-letter lookup table.
+    """
+    text = normalise(text, **kwargs)
+    text = _PUNCT_STRIP.sub(" ", text)
+    text = text.replace(_NUKTA, "").replace(_CHANDRABINDU, _ANUSVARA)
+    text = _CONJUNCT_NASAL.sub(_ANUSVARA, text)
+    # Code-mixed English: casing is not a transcription error.
+    return _WS.sub(" ", text.lower()).strip()

@@ -49,6 +49,12 @@ class DataCfg(BaseModel):
     max_train_utts: int | None = Field(
         None, description="Cap for fast Mac iteration; None = all."
     )
+    max_eval_utts: int | None = Field(
+        50,
+        description="Held-out clips to score. 50 keeps eval bearable on MPS but the "
+                    "resulting WER is a ~50-sample estimate with a wide interval; on a "
+                    "CUDA box set None to score the whole split and get a real number.",
+    )
 
 
 class IngestCfg(BaseModel):

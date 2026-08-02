@@ -42,11 +42,34 @@ STT_MODELS = {
         lora_targets=("q_proj", "v_proj"),
         notes="769M; ungated. Clear step up from small on Hindi. ~2.5x slower/step on MPS.",
     ),
+    "whisper-large-v3": BaseModelSpec(
+        "whisper-large-v3", "stt", "openai/whisper-large-v3", "whisper",
+        # Attention (all four) + both MLP projections. HF Whisper names the attention
+        # output `out_proj`, NOT `o_proj` as Llama-style models do — the wrong name
+        # adapts nothing. Widening the target set multiplies adapter capacity for
+        # almost no extra memory or step time, which beats raising `r` when the
+        # corpus is only a few thousand utterances.
+        lora_targets=("q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"),
+        notes="1.55B; ungated. Too big for a 16GB M4 — needs a CUDA GPU with fp16 "
+              "(A100/A10G). The accuracy headroom past whisper-medium lives here.",
+    ),
+    "whisper-hindi-large-v2": BaseModelSpec(
+        "whisper-hindi-large-v2", "stt", "vasista22/whisper-hindi-large-v2", "whisper",
+        lora_targets=("q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"),
+        notes="large-v2 already fine-tuned on Hindi (Apache-2.0, ungated). Adapting a "
+              "Hindi-aware model beats teaching Hindi to vanilla large-v3 from a few "
+              "thousand utterances. Same size class as large-v3, so L4 batch settings "
+              "carry over — but 80 mel bins vs large-v3's 128, which is fine because "
+              "the feature extractor is loaded from this checkpoint, not hardcoded.",
+    ),
     "indicwhisper": BaseModelSpec(
         "indicwhisper", "stt", "parthiv11/indic_whisper_multilingual", "whisper",
         lora_targets=("q_proj", "v_proj"),
-        notes="whisper-medium fine-tuned on Indic; strongest Hindi start — but GATED "
-              "(401 without an HF token). Needs HF_TOKEN to use.",
+        notes="BROKEN REPO — do not use. Previously annotated 'gated, needs HF_TOKEN'; "
+              "that was a guess from a 401. HF returns the same 401 for repos that do "
+              "not exist, and this id is absent from public model search while the "
+              "same author's other repos appear, so a token will NOT fix it. Use "
+              "whisper-hindi-large-v2 above instead.",
     ),
     "indicwav2vec": BaseModelSpec(
         "indicwav2vec", "stt", "ai4bharat/indicwav2vec-hindi", "wav2vec2",

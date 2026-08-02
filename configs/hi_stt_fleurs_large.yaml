@@ -1,0 +1,61 @@
+# Hindi STT on FLEURS with whisper-large-v3, for a CUDA GPU (Modal).
+#
+# Deliberately identical to hi_stt_fleurs.yaml except base_model, device, precision,
+# and batch shape — so the WER delta is attributable to the model, not the data.
+# Baseline to beat: whisper-medium on this same data scored WER 0.2955 / CER 0.1322.
+#
+# Run:  modal run modal_train.py
+run:
+  name: hi_stt_fleurs_large
+  track: stt
+  language: hi
+  seed: 1337
+
+data:
+  dataset: fleurs
+  hf_path: google/fleurs
+  hf_config: hi_in
+  licence: CC-BY-4.0
+  train_split: train
+  eval_split: validation
+  max_train_utts: 1500        # same cap as the medium run; raise once large-v3 is proven
+
+ingest:
+  target_sr: 16000
+  mono: true
+
+clean:
+  canonical_script: Devanagari
+  trim_silence: false
+  min_duration_s: 0.5
+  max_duration_s: 30.0
+  normalise_numerals: true
+  keep_code_mixing: true
+
+align:
+  aligner: none
+
+train:
+  base_model: whisper-large-v3
+  device: cuda
+  precision: fp16             # safe and necessary on CUDA; it's what makes 1.55B fit
+  lora:
+    enabled: true
+    r: 16
+    alpha: 32
+  epochs: 4
+  lr: 1.0e-4
+  batch_size: 4               # L4 24GB: large-v3 fp16 + grad ckpt fits at 4
+  grad_accum: 2               # effective batch stays 8, same as the medium run
+
+eval:
+  metrics: [wer, cer]
+  slices: [is_code_mixed]
+  thresholds:
+    wer: 0.10
+    cer: 0.08
+
+package:
+  quantise: false
+  serve_format: torch
+  rtf_target: 1.0

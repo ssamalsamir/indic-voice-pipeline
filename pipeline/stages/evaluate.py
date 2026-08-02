@@ -17,7 +17,7 @@ from pathlib import Path
 
 from pipeline import metrics as M
 from pipeline.stages.base import Stage
-from pipeline.text.normalise import normalise
+from pipeline.text.normalise import normalise_for_scoring
 from pipeline.utils.io import dump_json, read_jsonl, write_jsonl
 
 
@@ -92,7 +92,7 @@ class EvaluateStage(Stage):
         # the held-out set never overlaps training (honest WER) with one cached download.
         same = self.cfg.data.eval_split == self.cfg.data.train_split
         offset = (self.cfg.data.max_train_utts or 0) if same else 0
-        eval_cap = 50  # keep eval fast on MPS (each clip is a full transcription)
+        eval_cap = self.cfg.data.max_eval_utts  # None = score the whole split
         rows = stream_hf_corpus(
             hf_id=self.cfg.data.hf_path,
             hf_config=self.cfg.data.hf_config or self.cfg.run.language,
@@ -106,8 +106,12 @@ class EvaluateStage(Stage):
         return write_jsonl(out, ({**r, "text": self._norm(r["text"])} for r in rows))
 
     def _norm(self, text: str) -> str:
+        # Scoring pass, not the corpus pass: strips punctuation and folds nukta /
+        # anusvara spelling variants. Applied to BOTH sides (refs here, hyps in
+        # _collect_stt_pairs), so it can only remove differences, never invent
+        # agreement. The corpus itself keeps its punctuation — see normalise.py.
         cc = self.cfg.clean
-        return normalise(
+        return normalise_for_scoring(
             text, language=self.cfg.run.language,
             normalise_numerals=cc.normalise_numerals,
             expand_numbers_to_words=False,  # STT refs/hyps stay as digits
