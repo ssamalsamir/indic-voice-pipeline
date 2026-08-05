@@ -89,9 +89,17 @@ subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "-q", "torchao"]
                check=False)
 
 import torch
-print(f"GPU: {{torch.cuda.get_device_name()}} | "
+cap = torch.cuda.get_device_capability()
+print(f"GPU: {{torch.cuda.get_device_name()}} | sm_{{cap[0]}}{{cap[1]}} | "
       f"{{torch.cuda.get_device_properties(0).total_memory/1e9:.0f}} GB | "
       f"torch {{torch.__version__}}", flush=True)
+# Kaggle can hand out a P100 (Pascal, sm_60) that its OWN torch+cu128 image has no
+# kernels for: training then dies at step 0 with cudaErrorNoKernelImageForDevice.
+# Fail here instead, so the cause is the first line of the log rather than a CUDA
+# error 26s into a run that looked like it was working.
+if cap[0] < 7:
+    sys.exit(f"ABORT: sm_{{cap[0]}}{{cap[1]}} is too old for torch {{torch.__version__}} "
+             f"(needs sm_70+). Re-push requesting a T4.")
 
 cmd = [sys.executable, "-m", "pipeline.run", "all", "--config", {config!r}, "--force"]
 print("$ " + " ".join(cmd), flush=True)
@@ -115,7 +123,11 @@ def push(config: str) -> None:
         "language": "python",
         "kernelType": "script",
         "isPrivate": True,
-        "enableGpu": True,       # free T4/P100, ~30 h/week quota
+        "enableGpu": True,       # free GPU, ~30 h/week quota
+        # MUST pin T4 (sm_75). Left to Kaggle's choice it assigned a P100 (sm_60),
+        # which its own torch 2.10+cu128 image cannot emit kernels for. The installed
+        # kaggle client predates this field but the REST API honours it.
+        "accelerator": "nvidiaTeslaT4",
         "enableInternet": True,  # HF model + FLEURS download
         "datasetDataSources": [],
         "competitionDataSources": [],
