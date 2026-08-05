@@ -30,6 +30,9 @@ KAGGLE_USER = "samirsamal"
 SLUG = "indic-hindi-stt-whisper-lora"
 CONFIG = "configs/hi_stt_fleurs_hindi_v2_kaggle.yaml"
 API = "https://www.kaggle.com/api/v1"
+# Verify with --shape after a push: kernels/pull echoes machineShape back, so a value
+# the server rejected shows up as null rather than failing loudly at push time.
+MACHINE_SHAPE = "nvidiaTeslaT4"
 # Kaggle preinstalls torch/transformers/datasets; these are the gaps.
 EXTRA_DEPS = "peft>=0.11 torchcodec soundfile librosa pydantic>=2.6"
 
@@ -93,17 +96,38 @@ cap = torch.cuda.get_device_capability()
 print(f"GPU: {{torch.cuda.get_device_name()}} | sm_{{cap[0]}}{{cap[1]}} | "
       f"{{torch.cuda.get_device_properties(0).total_memory/1e9:.0f}} GB | "
       f"torch {{torch.__version__}}", flush=True)
-# Kaggle can hand out a P100 (Pascal, sm_60) that its OWN torch+cu128 image has no
-# kernels for: training then dies at step 0 with cudaErrorNoKernelImageForDevice.
-# Fail here instead, so the cause is the first line of the log rather than a CUDA
-# error 26s into a run that looked like it was working.
-if cap[0] < 7:
-    sys.exit(f"ABORT: sm_{{cap[0]}}{{cap[1]}} is too old for torch {{torch.__version__}} "
-             f"(needs sm_70+). Re-push requesting a T4.")
 
-cmd = [sys.executable, "-m", "pipeline.run", "all", "--config", {config!r}, "--force"]
-print("$ " + " ".join(cmd), flush=True)
-rc = subprocess.run(cmd, check=False).returncode
+
+def run(*stages):
+    for s in stages:
+        cmd = [sys.executable, "-m", "pipeline.run", s, "--config", {config!r}, "--force"]
+        print("$ " + " ".join(cmd), flush=True)
+        rc = subprocess.run(cmd, check=False).returncode
+        if rc:
+            return rc
+    return 0
+
+
+# Kaggle hands this account a P100 (Pascal, sm_60) that its OWN torch 2.10+cu128 image
+# has no kernels for, and machineShape cannot pin a T4 -- the API normalises it to a
+# generic "Gpu". So make the P100 work instead of gambling on the assignment.
+#
+# Split by what each stage actually needs: ingest decodes FLEURS through
+# datasets+torchcodec, which only works on Kaggle's current image, while train/evaluate
+# read audio via soundfile and never import datasets. So prep the data first, THEN swap
+# in a torch old enough to still ship Pascal kernels.
+if cap[0] < 7:
+    rc = run("ingest", "clean", "align")
+    if rc:
+        sys.exit(rc)
+    print(f"[torch] sm_{{cap[0]}}{{cap[1]}} unsupported by {{torch.__version__}}; "
+           f"installing a Pascal-capable build", flush=True)
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q",
+                    "torch==2.5.1", "torchaudio==2.5.1",
+                    "--index-url", "https://download.pytorch.org/whl/cu121"], check=True)
+    rc = run("train", "evaluate")
+else:
+    rc = run("ingest", "clean", "align", "train", "evaluate")
 
 # Surface metrics in the log so the result is visible without downloading output.
 for p in sorted(__import__("pathlib").Path(WORK, "runs").glob("*/metrics.json")):
@@ -125,9 +149,10 @@ def push(config: str) -> None:
         "isPrivate": True,
         "enableGpu": True,       # free GPU, ~30 h/week quota
         # MUST pin T4 (sm_75). Left to Kaggle's choice it assigned a P100 (sm_60),
-        # which its own torch 2.10+cu128 image cannot emit kernels for. The installed
-        # kaggle client predates this field but the REST API honours it.
-        "accelerator": "nvidiaTeslaT4",
+        # which its own torch 2.10+cu128 image cannot emit kernels for. The selector is
+        # `machineShape` (confirmed via kernels/pull); an `accelerator` key is silently
+        # IGNORED, which is how two runs landed on a P100 while claiming to ask for T4.
+        "machineShape": MACHINE_SHAPE,
         "enableInternet": True,  # HF model + FLEURS download
         "datasetDataSources": [],
         "competitionDataSources": [],
@@ -135,6 +160,12 @@ def push(config: str) -> None:
         "categoryIds": [],
     })
     print(json.dumps(resp, indent=2)[:600])
+
+
+def shape() -> None:
+    """Did the server actually accept our machineShape, or silently drop it?"""
+    md = _get(f"kernels/pull?userName={KAGGLE_USER}&kernelSlug={SLUG}").get("metadata", {})
+    print(f"machineShape={md.get('machineShape')!r} enableGpu={md.get('enableGpu')!r}")
 
 
 def status() -> None:
@@ -146,5 +177,11 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=CONFIG)
     ap.add_argument("--status", action="store_true")
+    ap.add_argument("--shape", action="store_true")
     a = ap.parse_args()
-    status() if a.status else push(a.config)
+    if a.shape:
+        shape()
+    elif a.status:
+        status()
+    else:
+        push(a.config)
