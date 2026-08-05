@@ -81,6 +81,12 @@ tarfile.open(fileobj=io.BytesIO(base64.b64decode(PAYLOAD)), mode="r:gz").extract
 
 subprocess.run([sys.executable, "-m", "pip", "install", "-q", *{EXTRA_DEPS!r}.split()],
                check=True)
+# Kaggle ships torchao 0.10.0; peft's LoRA dispatcher RAISES on an old torchao rather
+# than ignoring it, killing the run at adapter injection. We never quantize, and
+# is_torchao_available() returns False cleanly when it is simply absent, so removing it
+# beats upgrading into a conflict with Kaggle's pinned torch.
+subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "-q", "torchao"],
+               check=False)
 
 import torch
 print(f"GPU: {{torch.cuda.get_device_name()}} | "
