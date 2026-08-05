@@ -1,0 +1,72 @@
+# Hindi STT on the FULL FLEURS train split with whisper-large-v3 (Modal L4).
+#
+# Identical to hi_stt_fleurs_large.yaml except the two caps, so the delta is
+# attributable to sample size alone:
+#   max_train_utts  1500 -> null   train on everything FLEURS Hindi has
+#   max_eval_utts     50 -> null   score the whole validation split
+#
+# Why the eval cap matters as much as the train cap: the 0.1712 WER we're trying to
+# beat was measured on 39 clips. At that sample size the interval is wide enough that
+# 0.1712 and 0.10 aren't cleanly distinguishable, so scoring the full split is what
+# makes the verdict mean anything. The 50-clip cap only ever existed to keep eval
+# bearable on MPS; on an L4 it costs minutes.
+#
+# Baselines on this data:  whisper-medium 0.2955 WER / 0.1322 CER (M4, 1500 utts)
+#                          whisper-large-v3 0.1712 WER / 0.0660 CER (L4, 1500 utts)
+#
+# Run:  modal run --detach modal_train.py --config configs/hi_stt_fleurs_large_full.yaml
+run:
+  name: hi_stt_fleurs_hindi_v2_kaggle
+  track: stt
+  language: hi
+  seed: 1337
+
+data:
+  dataset: fleurs
+  hf_path: google/fleurs
+  hf_config: hi_in
+  licence: CC-BY-4.0
+  train_split: train
+  eval_split: validation
+  max_train_utts: null        # all of it — the 1500 cap was an M4 concession
+  max_eval_utts: null         # score the whole held-out split, not a 50-clip sample
+
+ingest:
+  target_sr: 16000
+  mono: true
+
+clean:
+  canonical_script: Devanagari
+  trim_silence: false
+  min_duration_s: 0.5
+  max_duration_s: 30.0
+  normalise_numerals: true
+  keep_code_mixing: true
+
+align:
+  aligner: none
+
+train:
+  base_model: whisper-hindi-large-v2
+  device: cuda
+  precision: fp16
+  lora:
+    enabled: true
+    r: 16
+    alpha: 32
+  epochs: 4
+  lr: 1.0e-4
+  batch_size: 2
+  grad_accum: 4
+
+eval:
+  metrics: [wer, cer]
+  slices: [is_code_mixed]
+  thresholds:
+    wer: 0.10
+    cer: 0.08
+
+package:
+  quantise: false
+  serve_format: torch
+  rtf_target: 1.0

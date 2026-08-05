@@ -15,10 +15,14 @@ Cost note: A100-80GB bills ~$2.10/hr by the second, so a ~30min run is ~$1 of th
 $30/month free credit. `timeout` below is the hard ceiling on a runaway job.
 """
 
+import os
+
 import modal
 
 APP_NAME = "indic-voice-pipeline"
 CONFIG = "configs/hi_stt_fleurs_large.yaml"
+# Override with MODAL_GPU=L4 (etc) when a card is cheap and actually available.
+GPU = os.environ.get("MODAL_GPU", "A10G")
 
 # Volume keeps runs/ (corpus, checkpoints, metrics) alive between invocations, so an
 # interrupted run resumes via train.py's checkpoint auto-resume instead of restarting.
@@ -46,11 +50,19 @@ app = modal.App(APP_NAME, image=image)
 
 
 @app.function(
-    # A100/H100 require a payment method on file even with free credit. L4 (24GB)
-    # is the cheapest card that still holds large-v3 + LoRA in fp16.
-    gpu="L4",
+    # A100/H100 require a payment method on file even with free credit. A10G (24GB)
+    # holds large-v3 + LoRA in fp16 like L4 does, and L4 was capacity-starved: runs
+    # sat in "waiting to be scheduled on a GPU_L4 worker" and then took a
+    # KeyboardInterrupt when the scheduler reclaimed the container.
+    gpu=GPU,
     volumes={RUNS_DIR: volume},
     timeout=6 * 60 * 60,
+    # Capacity evictions are infra failures, not pipeline failures, so they raise and
+    # are retried — while a real pipeline error returns a nonzero exit_code normally
+    # and is NOT retried. Each retry resumes from the last checkpoint on the volume
+    # (train.py auto-resumes), so an eviction costs at most `save_steps` of progress
+    # instead of the whole run. This is what actually makes the lid safe to close.
+    retries=modal.Retries(max_retries=10, initial_delay=60.0, backoff_coefficient=1.0),
     # No secret needed: FLEURS and whisper-large-v3 are both ungated. Gated models
     # (indicwhisper) would need secrets=[modal.Secret.from_name("huggingface")].
 )
@@ -74,10 +86,37 @@ def run_pipeline(stage: str = "all", config: str = CONFIG) -> dict:
           f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.0f} GB | "
           f"torch {torch.__version__}", flush=True)
 
+    # Checkpoints are worthless unless they outlive an eviction. A single commit after
+    # the subprocess never runs when the scheduler reclaims the container mid-training,
+    # which is how a preempted run came back with an EMPTY checkpoint dir. Commit while
+    # training instead, so a retry resumes instead of restarting at step 0.
+    import threading
+
+    def _complete_checkpoints_exist() -> bool:
+        """HF writes trainer_state.json at the END of saving a checkpoint, so its
+        presence marks that dir as finished. Committing mid-write would persist a
+        half-saved checkpoint that resume then chokes on."""
+        ckpts = sorted(Path(RUNS_DIR).glob("*/checkpoint/checkpoint-*"))
+        return bool(ckpts) and (ckpts[-1] / "trainer_state.json").exists()
+
+    stop = threading.Event()
+
+    def _periodic_commit() -> None:
+        while not stop.wait(120):
+            try:
+                if _complete_checkpoints_exist():
+                    volume.commit()
+                    print("[commit] checkpoints flushed to volume", flush=True)
+            except Exception as exc:  # never let the watchdog kill the run
+                print(f"[commit] failed (will retry): {exc}", flush=True)
+
+    threading.Thread(target=_periodic_commit, daemon=True).start()
+
     cmd = [sys.executable, "-m", "pipeline.run", stage, "--config", config, "--force"]
     print(f"$ {' '.join(cmd)}", flush=True)
     result = subprocess.run(cmd, check=False)
 
+    stop.set()
     volume.commit()  # flush checkpoints/metrics before the container dies
 
     metrics = {
