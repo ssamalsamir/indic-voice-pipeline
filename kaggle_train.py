@@ -135,6 +135,17 @@ if cap[0] < 7:
     rc = run("ingest", "clean", "align")
     if rc:
         sys.exit(rc)
+    # Build the EVAL manifest here too, while datasets+torchcodec still work.
+    # evaluate downloads its own held-out split via load_dataset, so running it after
+    # the torch swap dies on torchcodec's ABI ("undefined symbol: ...c10_cuda...") --
+    # which is exactly how a completed 4.8h training run produced no WER. The manifest
+    # is cached to disk, so evaluate later finds it and never touches datasets.
+    subprocess.run([sys.executable, "-c",
+                    "from pipeline.config import PipelineConfig;"
+                    "from pipeline.stages.evaluate import EvaluateStage;"
+                    "s=EvaluateStage(PipelineConfig.load({config!r}));"
+                    "print('[eval] manifest ready:', s._ensure_eval_manifest())"],
+                   check=True)
     print(f"[torch] sm_{{cap[0]}}{{cap[1]}} unsupported by {{torch.__version__}}; "
            f"installing a Pascal-capable build", flush=True)
     subprocess.run([sys.executable, "-m", "pip", "install", "-q",
