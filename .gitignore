@@ -17,3 +17,7 @@ reports/*
 
 # Tooling caches
 .impeccable/
+
+# Generated per-run reports stay ignored, but the curated write-up (acceptance #11)
+# is a deliverable, not an artifact.
+!reports/RESULTS.md
