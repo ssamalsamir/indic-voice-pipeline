@@ -84,7 +84,7 @@ class EvaluateStage(Stage):
     def _ensure_eval_manifest(self):
         """Stream the held-out split once, normalise references, cache to disk."""
         out = self.cfg.run_dir / "eval_manifest.jsonl"
-        if out.exists():
+        if out.exists() and self._refs_match_current_norm(out):
             return out
         from pipeline.sources import stream_hf_corpus  # noqa: PLC0415
 
@@ -104,6 +104,23 @@ class EvaluateStage(Stage):
             offset=offset,
         )
         return write_jsonl(out, ({**r, "text": self._norm(r["text"])} for r in rows))
+
+    def _refs_match_current_norm(self, manifest) -> bool:
+        """Is the cached manifest's normalisation the one we score hypotheses with?
+
+        Refs are normalised when this file is WRITTEN, hyps every time we score. Change
+        the normaliser and a cached manifest silently pairs old refs against new hyps —
+        stripped hyps vs punctuated refs, which inflates WER and looks like the model
+        got worse. Normalised text is idempotent under its own normaliser, so refs that
+        change when re-normalised prove the cache is stale.
+        """
+        for row in read_jsonl(manifest):
+            if self._norm(row["text"]) != row["text"]:
+                self.log.info("eval manifest was built with a different normaliser — "
+                              "rebuilding so refs and hyps are scored the same way")
+                return False
+            return True   # first row is enough; they all took the same path
+        return False      # empty file: rebuild
 
     def _norm(self, text: str) -> str:
         # Scoring pass, not the corpus pass: strips punctuation and folds nukta /
