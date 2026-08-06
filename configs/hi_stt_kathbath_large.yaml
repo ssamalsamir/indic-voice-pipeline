@@ -1,0 +1,69 @@
+# Hindi STT on Kathbath — the data step-change.
+#
+# FLEURS gives 2,115 utterances total, which is why every FLEURS run plateaus well
+# above the 0.10 bar no matter how the adapter is tuned. Kathbath Hindi is 32 train
+# shards at ~472MB each, so this is a different regime rather than a bigger knob.
+#
+# Baselines to beat:  whisper-medium    0.2955 WER / 0.1322 CER  (M4,  FLEURS 1500)
+#                     whisper-large-v3  0.1712 WER / 0.0660 CER  (L4,  FLEURS 1500)
+#
+# max_train_utts is CAPPED, deliberately. stream_hf_corpus downloads the whole split
+# archive before slicing, so uncapping this pulls ~15GB before a single step runs and
+# will not fit Kaggle's disk or its 12h wall clock. Raise it on a box with room.
+run:
+  name: hi_stt_kathbath_large
+  track: stt
+  language: hi
+  seed: 1337
+
+data:
+  dataset: kathbath
+  hf_path: ai4bharat/Kathbath
+  hf_config: hindi          # NOT "hi" — Kathbath names configs by full language
+  licence: CC-BY-4.0
+  train_split: train
+  eval_split: valid         # a real held-out split, not a slice of train
+  max_train_utts: 8000      # ~4x FLEURS; bounded by disk and the 12h Kaggle cap
+  max_eval_utts: 500        # enough that WER has a tight interval
+
+ingest:
+  target_sr: 16000
+  mono: true
+
+clean:
+  canonical_script: Devanagari
+  trim_silence: false
+  min_duration_s: 0.5
+  max_duration_s: 20.0
+  normalise_numerals: true
+  keep_code_mixing: true
+
+align:
+  aligner: none
+
+train:
+  base_model: whisper-hindi-large-v2
+  device: cuda
+  precision: fp16
+  lora:
+    enabled: true
+    r: 16
+    alpha: 32
+  # Two, not four: more data means each epoch already shows the model more variety,
+  # and best-checkpoint selection stops us shipping an overfit final step anyway.
+  epochs: 2
+  lr: 1.0e-4
+  batch_size: 2
+  grad_accum: 4
+
+eval:
+  metrics: [wer, cer]
+  slices: [is_code_mixed]
+  thresholds:
+    wer: 0.10
+    cer: 0.08
+
+package:
+  quantise: false
+  serve_format: torch
+  rtf_target: 1.0

@@ -12,6 +12,10 @@ from pathlib import Path
 from typing import Iterator
 
 _TEXT_KEYS = ("sentence", "text", "transcript", "transcription", "raw_transcription")
+# Every corpus names its audio column differently: FLEURS "audio", Kathbath
+# "audio_filepath". Resolve it from the schema rather than hardcoding, the same way
+# _TEXT_KEYS already does for transcripts.
+_AUDIO_KEYS = ("audio", "audio_filepath", "audio_path", "path", "file")
 
 
 def stream_hf_corpus(
@@ -31,11 +35,12 @@ def stream_hf_corpus(
     audio_dir.mkdir(parents=True, exist_ok=True)
     split_expr = f"{split}[{offset}:{offset + cap}]" if cap else split
     dset = load_dataset(hf_id, hf_config, split=split_expr, trust_remote_code=True)
-    dset = dset.cast_column("audio", Audio(sampling_rate=target_sr))
+    audio_key = _pick_key(dset.column_names, _AUDIO_KEYS, "audio")
+    dset = dset.cast_column(audio_key, Audio(sampling_rate=target_sr))
     text_key = _pick_text_key(dset[0])
 
     for i, ex in enumerate(dset):
-        audio = ex["audio"]
+        audio = ex[audio_key]
         idx = offset + i
         wav_path = audio_dir / f"{language}_{split}_{idx:07d}.wav"
         sf.write(wav_path, audio["array"], target_sr)
@@ -49,6 +54,17 @@ def stream_hf_corpus(
             "domain": ex.get("domain", "general"),
             "source": f"{hf_id}:{hf_config}:{split_expr}",
         }
+
+
+def _pick_key(columns, candidates, what: str) -> str:
+    """First candidate present in `columns`. Fails loudly listing what WAS there, so a
+    new corpus with an unknown column name is a one-line fix rather than a mystery."""
+    for k in candidates:
+        if k in columns:
+            return k
+    raise KeyError(
+        f"no {what} column found in {list(columns)}; expected one of {candidates}"
+    )
 
 
 def _pick_text_key(example: dict) -> str:

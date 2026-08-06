@@ -64,6 +64,17 @@ def _get(path: str) -> dict:
         return json.loads(r.read())
 
 
+def _hf_token() -> str:
+    """Read the HF token from the standard cache path, NOT from the repo.
+
+    Gated corpora (ai4bharat/*) need it at ingest. It gets injected into the generated
+    kernel source at push time, so it lives in the private kernel and never in git —
+    this repo is public. Absent token is fine for ungated runs (FLEURS, the model).
+    """
+    p = pathlib.Path.home() / ".cache" / "huggingface" / "token"
+    return p.read_text().strip() if p.exists() else ""
+
+
 def _payload() -> str:
     """gzip+b64 the source the kernel needs. __pycache__ excluded so the blob is
     reproducible and small."""
@@ -80,6 +91,10 @@ import base64, io, os, subprocess, sys, tarfile
 
 WORK = "/kaggle/working"
 os.chdir(WORK)
+# Injected at push time from ~/.cache/huggingface/token; empty for ungated runs.
+if HF_TOKEN:
+    os.environ["HF_TOKEN"] = os.environ["HUGGING_FACE_HUB_TOKEN"] = HF_TOKEN
+    print("[hf] token present — gated datasets available", flush=True)
 tarfile.open(fileobj=io.BytesIO(base64.b64decode(PAYLOAD)), mode="r:gz").extractall(WORK)
 
 subprocess.run([sys.executable, "-m", "pip", "install", "-q", *{EXTRA_DEPS!r}.split()],
@@ -156,7 +171,8 @@ sys.exit(rc)
 
 
 def push(config: str) -> None:
-    src = f'PAYLOAD = "{_payload()}"\n' + _kernel_source(config)
+    src = (f'PAYLOAD = "{_payload()}"\nHF_TOKEN = "{_hf_token()}"\n'
+           + _kernel_source(config))
     print(f"kernel script: {len(src)/1024:.0f} KB")
     resp = _post("kernels/push", {
         "slug": f"{KAGGLE_USER}/{SLUG}",
