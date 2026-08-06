@@ -27,7 +27,11 @@ class PackageStage(Stage):
     def run(self) -> Path:
         ckpt = self.cfg.run_dir / "checkpoint"
         if not ckpt.exists():
-            raise FileNotFoundError("run `train` first — checkpoint missing")
+            # Same rule as evaluate: a released TTS voice is a shippable baseline worth
+            # packaging and timing; an unfine-tuned STT run has nothing to package.
+            if self.cfg.run.track.value == "stt":
+                raise FileNotFoundError("run `train` first — checkpoint missing")
+            self.log.warning("no checkpoint — packaging the BASE voice")
 
         artifact = self.cfg.run_dir / "artifact"
         artifact.mkdir(parents=True, exist_ok=True)
@@ -80,27 +84,28 @@ class PackageStage(Stage):
             "p50_ms": None, "p95_ms": None, "gate": "UNMEASURED", "measured": False,
         }
 
-        rows = self._rtf_clips()
+        is_stt = self.cfg.run.track.value == "stt"
+        rows = self._rtf_clips(need_audio=is_stt)
         if not rows:
             self.log.warning("no clips available to time — RTF left unmeasured")
             return unmeasured
 
         try:
-            transcriber = self._build_transcriber()
+            run_once = self._timed_call(is_stt)
         except Exception as exc:  # noqa: BLE001 - packaging must not die on RTF
             self.log.warning("could not load model for RTF (%s) — leaving unmeasured", exc)
             return unmeasured
 
-        transcriber.transcribe(rows[0]["audio_path"], self.cfg.ingest.target_sr,
-                               num_beams=1)  # warm-up: first call pays lazy init
+        run_once(rows[0])  # warm-up: the first call pays lazy init and kernel compile
 
         latencies, audio_s = [], 0.0
         for row in rows:
             t0 = time.perf_counter()
-            transcriber.transcribe(row["audio_path"], self.cfg.ingest.target_sr,
-                                   num_beams=1)
+            produced = run_once(row)
             latencies.append((time.perf_counter() - t0) * 1000)
-            audio_s += float(row.get("duration_s") or 0.0)
+            # STT consumes the clip's audio; TTS PRODUCES it, so the denominator is the
+            # synthesised duration, not anything that existed beforehand.
+            audio_s += float(row.get("duration_s") or 0.0) if is_stt else produced
 
         if audio_s <= 0:
             self.log.warning("clips carry no duration — RTF left unmeasured")
@@ -118,17 +123,49 @@ class PackageStage(Stage):
             "measured": True,
         }
 
-    def _rtf_clips(self) -> list[dict]:
-        """Prefer the held-out eval clips; fall back to the train manifest."""
+    def _rtf_clips(self, need_audio: bool = True) -> list[dict]:
+        """Prefer the held-out eval rows; fall back to the train manifest.
+
+        STT needs real audio on disk to consume; TTS needs only text, since it makes the
+        audio itself.
+        """
+        def usable(r: dict) -> bool:
+            if need_audio:
+                return bool(r.get("audio_path")) and Path(r["audio_path"]).exists()
+            return bool((r.get("text") or "").strip())
+
         for name in ("eval_manifest.jsonl", "manifest.jsonl"):
             path = self.cfg.run_dir / name
             if not path.exists():
                 continue
-            rows = [r for r in read_jsonl(path)
-                    if r.get("audio_path") and Path(r["audio_path"]).exists()]
+            rows = [r for r in read_jsonl(path) if usable(r)]
             if rows:
                 return rows[:self._RTF_CLIPS]
         return []
+
+    def _timed_call(self, is_stt: bool):
+        """Return f(row) -> seconds of audio produced (TTS) or 0.0 (STT)."""
+        if is_stt:
+            transcriber = self._build_transcriber()
+
+            def stt(row):
+                transcriber.transcribe(row["audio_path"], self.cfg.ingest.target_sr,
+                                       num_beams=1)
+                return 0.0
+            return stt
+
+        from pipeline.registry import get_base_model  # noqa: PLC0415
+        from pipeline.tts import VitsSynthesiser  # noqa: PLC0415
+
+        ckpt = self.cfg.run_dir / "checkpoint"
+        synth = VitsSynthesiser(ckpt if ckpt.exists() else None,
+                                get_base_model(self.cfg.train.base_model).hf_id,
+                                self.cfg.train.device)
+
+        def tts(row):
+            audio = synth.synthesise(row["text"])
+            return len(audio) / synth.sampling_rate
+        return tts
 
     def _build_transcriber(self):
         import json  # noqa: PLC0415
