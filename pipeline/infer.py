@@ -58,7 +58,22 @@ class WhisperTranscriber:
         )
 
         gc = getattr(self.model, "generation_config", None)
-        if gc is None or getattr(gc, "lang_to_id", None):
+        if gc is None:
+            return
+
+        # train.py sets config.suppress_tokens = [] so the model can learn freely, and
+        # that EMPTY list is saved into the checkpoint. At generation transformers does
+        # suppress_tokens[-2] on a size-0 tensor and dies with
+        # "IndexError: index -2 is out of bounds for dimension 0 with size 0".
+        # Empty means "suppress nothing", which is what None means here — [] is the one
+        # value that type-checks and still crashes. Runs before the lang_to_id early
+        # return because a checkpoint can need this fix and not that one.
+        for cfg in (gc, getattr(self.model, "config", None)):
+            for attr in ("suppress_tokens", "begin_suppress_tokens"):
+                if cfg is not None and getattr(cfg, attr, None) == []:
+                    setattr(cfg, attr, None)
+
+        if getattr(gc, "lang_to_id", None):
             return
         tok = self.processor.tokenizer
         unk = tok.unk_token_id
