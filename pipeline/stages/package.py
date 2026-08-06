@@ -35,8 +35,12 @@ class PackageStage(Stage):
 
         latency = self._measure_rtf(artifact)
         dump_json(self.cfg.run_dir / "latency.json", latency)
-        self.log.info("RTF=%.3f (gate <= %.2f) -> %s",
-                      latency["rtf"], self.cfg.package.rtf_target, latency["gate"])
+        if latency["measured"]:
+            self.log.info("RTF=%.3f (gate <= %.2f) -> %s  [p50=%sms p95=%sms over %s clips]",
+                          latency["rtf"], self.cfg.package.rtf_target, latency["gate"],
+                          latency["p50_ms"], latency["p95_ms"], latency["n_clips"])
+        else:
+            self.log.warning("RTF UNMEASURED — the card will say so rather than claim a pass")
 
         card = render_model_card(self.cfg, self._load_metrics(), latency)
         self.out_path.write_text(card, encoding="utf-8")
@@ -55,19 +59,92 @@ class PackageStage(Stage):
             f"export {ckpt} as {fmt}, quantise={self.cfg.package.quantise}\n"
         )
 
+    # Enough clips for a stable p95 without turning `package` into another eval run.
+    _RTF_CLIPS = 12
+
     def _measure_rtf(self, artifact: Path) -> dict:
-        """RTF = compute_time / audio_duration, measured over a warm-up + timed loop on
-        this machine. Stubbed value until the serving wrapper is wired (Week 7)."""
+        """RTF = compute_time / audio_duration over a warm-up plus timed loop.
+
+        Measured on THIS machine because that is the on-prem target: an RTF from a
+        datacentre GPU says nothing about whether the thing runs on the box it ships to.
+        Returns measured=False (and never a PASS) when it genuinely could not measure —
+        a hardcoded 0.0 that auto-passes the gate is worse than an honest gap, because
+        it reports the requirement as met while proving nothing.
+        """
+        import statistics  # noqa: PLC0415
+        import time  # noqa: PLC0415
+
         target = self.cfg.package.rtf_target
-        rtf = 0.0  # replace with measured value
-        return {
-            "hardware": "apple-silicon-mps",
-            "rtf": rtf,
-            "p50_ms": None,
-            "p95_ms": None,
-            "gate": "PASS" if rtf <= target else "FAIL",
-            "measured": False,
+        unmeasured = {
+            "hardware": self.cfg.train.device, "rtf": None,
+            "p50_ms": None, "p95_ms": None, "gate": "UNMEASURED", "measured": False,
         }
+
+        rows = self._rtf_clips()
+        if not rows:
+            self.log.warning("no clips available to time — RTF left unmeasured")
+            return unmeasured
+
+        try:
+            transcriber = self._build_transcriber()
+        except Exception as exc:  # noqa: BLE001 - packaging must not die on RTF
+            self.log.warning("could not load model for RTF (%s) — leaving unmeasured", exc)
+            return unmeasured
+
+        transcriber.transcribe(rows[0]["audio_path"], self.cfg.ingest.target_sr,
+                               num_beams=1)  # warm-up: first call pays lazy init
+
+        latencies, audio_s = [], 0.0
+        for row in rows:
+            t0 = time.perf_counter()
+            transcriber.transcribe(row["audio_path"], self.cfg.ingest.target_sr,
+                                   num_beams=1)
+            latencies.append((time.perf_counter() - t0) * 1000)
+            audio_s += float(row.get("duration_s") or 0.0)
+
+        if audio_s <= 0:
+            self.log.warning("clips carry no duration — RTF left unmeasured")
+            return unmeasured
+
+        rtf = (sum(latencies) / 1000) / audio_s
+        return {
+            "hardware": self.cfg.train.device,
+            "rtf": round(rtf, 4),
+            "p50_ms": round(statistics.median(latencies), 1),
+            "p95_ms": round(sorted(latencies)[max(0, int(len(latencies) * 0.95) - 1)], 1),
+            "n_clips": len(latencies),
+            "audio_s": round(audio_s, 1),
+            "gate": "PASS" if rtf <= target else "FAIL",
+            "measured": True,
+        }
+
+    def _rtf_clips(self) -> list[dict]:
+        """Prefer the held-out eval clips; fall back to the train manifest."""
+        for name in ("eval_manifest.jsonl", "manifest.jsonl"):
+            path = self.cfg.run_dir / name
+            if not path.exists():
+                continue
+            rows = [r for r in read_jsonl(path)
+                    if r.get("audio_path") and Path(r["audio_path"]).exists()]
+            if rows:
+                return rows[:self._RTF_CLIPS]
+        return []
+
+    def _build_transcriber(self):
+        import json  # noqa: PLC0415
+
+        from pipeline.infer import WhisperTranscriber  # noqa: PLC0415
+        from pipeline.registry import get_base_model  # noqa: PLC0415
+
+        # Prefer what training actually used; the config is only a fallback, since a
+        # rescued checkpoint can outlive the config that produced it.
+        meta_path = self.cfg.run_dir / "checkpoint" / "train_meta.json"
+        base = None
+        if meta_path.exists():
+            base = json.loads(meta_path.read_text()).get("base_hf_id")
+        base = base or get_base_model(self.cfg.train.base_model).hf_id
+        return WhisperTranscriber(self.cfg.run_dir / "checkpoint", base,
+                                  self.cfg.run.language, device=self.cfg.train.device)
 
     def _load_metrics(self) -> dict:
         m = self.cfg.run_dir / "metrics.json"
