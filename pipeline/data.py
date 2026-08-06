@@ -40,14 +40,49 @@ def load_audio(path: str, target_sr: int = 16_000):
     return np.asarray(array, dtype=np.float32)
 
 
+# SpecAugment, on the log-mel features. Whisper's own defaults; with only a couple of
+# thousand utterances the model memorises the corpus long before it generalises, and
+# masking is the cheapest regulariser that does not need more audio.
+_FREQ_MASKS, _FREQ_WIDTH = 2, 12   # mel bins per mask
+_TIME_MASKS, _TIME_WIDTH = 2, 60   # frames per mask (~0.6s at 10ms hop)
+
+
+def spec_augment(features, rng):
+    """Zero random frequency bands and time spans of one log-mel spectrogram.
+
+    Returns a COPY: the caller's array is reused across epochs, so masking in place
+    would erase real audio permanently and compound every epoch.
+    """
+    import numpy as np  # noqa: PLC0415
+
+    out = np.array(features, copy=True)
+    n_mels, n_frames = out.shape
+    for _ in range(_FREQ_MASKS):
+        w = int(rng.integers(0, _FREQ_WIDTH + 1))
+        if w:
+            f0 = int(rng.integers(0, max(1, n_mels - w)))
+            out[f0:f0 + w, :] = 0.0
+    for _ in range(_TIME_MASKS):
+        w = int(rng.integers(0, _TIME_WIDTH + 1))
+        if w:
+            t0 = int(rng.integers(0, max(1, n_frames - w)))
+            out[:, t0:t0 + w] = 0.0
+    return out
+
+
 class WhisperManifestDataset:
     """Lazy map-style dataset over a manifest for Whisper fine-tuning."""
 
-    def __init__(self, manifest: Path, processor: Any, language: str, target_sr: int = 16_000):
+    def __init__(self, manifest: Path, processor: Any, language: str, target_sr: int = 16_000,
+                 augment: bool = False, seed: int = 0):
         self.rows = [r for r in read_jsonl(manifest) if r.get("audio_path")]
         self.processor = processor
         self.language = language
         self.target_sr = target_sr
+        # Augment TRAIN only. Masking the dev split would make eval_loss a moving
+        # target and corrupt the very signal we pick the best checkpoint on.
+        self.augment = augment
+        self._seed = seed
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -58,6 +93,12 @@ class WhisperManifestDataset:
         features = self.processor.feature_extractor(
             audio, sampling_rate=self.target_sr
         ).input_features[0]
+        if self.augment:
+            import numpy as np  # noqa: PLC0415
+
+            # Seeded per (run, item) so a resumed run is reproducible, but each clip
+            # still gets its own mask rather than the whole corpus sharing one.
+            features = spec_augment(features, np.random.default_rng(self._seed + i))
         labels = self.processor.tokenizer(row["text"]).input_ids
         return {"input_features": features, "labels": labels}
 

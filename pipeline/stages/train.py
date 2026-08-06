@@ -110,10 +110,18 @@ class TrainStage(Stage):
         # point, so without this we ship whichever weights step N happened to land on.
         # Not the eval set — that's a different split entirely, scored in stage 5.
         holdout = max(1, round(len(dataset) * _HOLDOUT_FRACTION))
-        train_ds, dev_ds = torch.utils.data.random_split(
-            dataset, [len(dataset) - holdout, holdout],
-            generator=torch.Generator().manual_seed(self.cfg.run.seed),
-        )
+        # Split by INDEX rather than random_split, because train and dev must come from
+        # two different dataset objects: SpecAugment is on for train and off for dev.
+        # random_split returns Subsets of one shared object, so a single augment flag
+        # would mask the dev split too and make eval_loss a moving target.
+        perm = torch.randperm(
+            len(dataset), generator=torch.Generator().manual_seed(self.cfg.run.seed)
+        ).tolist()
+        aug = WhisperManifestDataset(manifest, processor, self.cfg.run.language,
+                                     self.cfg.ingest.target_sr, augment=True,
+                                     seed=self.cfg.run.seed)
+        dev_ds = torch.utils.data.Subset(dataset, perm[:holdout])
+        train_ds = torch.utils.data.Subset(aug, perm[holdout:])
         self.log.info("train=%d dev=%d (dev is for checkpoint selection only)",
                       len(train_ds), len(dev_ds))
 
