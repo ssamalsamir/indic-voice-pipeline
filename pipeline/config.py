@@ -104,6 +104,11 @@ class TrainCfg(BaseModel):
     # TTS-only
     voice_id: str | None = None
     speaker_ref_audio: Path | None = None
+    # TTS only. Freeze the HiFi-GAN decoder and posterior encoder and adapt the prior
+    # side (text encoder, duration predictor, flow) alone. Training the vocoder
+    # adversarially from a randomly initialised discriminator on a small corpus
+    # measurably destroys a pretrained voice — see the note in stages/train.py.
+    freeze_vocoder: bool = False
 
     @model_validator(mode="after")
     def _never_from_scratch(self) -> "TrainCfg":

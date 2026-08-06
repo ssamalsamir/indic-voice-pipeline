@@ -54,8 +54,14 @@ train:
   # 30 epochs over 100 utterances (~390 steps), not the 200 a from-scratch VITS wants.
   # This is an ADAPTATION of an already-trained voice: the pretrained model starts near
   # a good optimum, and long training on 100 clips walks away from it into memorisation.
+  # Adapt the text/duration side; leave the pretrained vocoder alone. The full
+  # adversarial run is implemented and works mechanically, but on 100 clips with a
+  # fresh discriminator it drove intelligibility from 0.16 to 1.04 WER.
+  freeze_vocoder: true
   epochs: 30
-  lr: 2.0e-4
+  # 10x lower than the adversarial run. This is adaptation of an already-good model,
+  # and 2e-4 moves a pretrained prior further in 390 steps than the data supports.
+  lr: 2.0e-5
   # 8, not 16: the posterior encoder and flow run over FULL-length spectrograms (up to
   # ~1000 frames here) before anything gets sliced, and that is the memory peak on a
   # 16GB M4. Only the vocoder sees short windows.

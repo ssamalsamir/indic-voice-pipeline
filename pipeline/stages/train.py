@@ -242,9 +242,34 @@ class TrainStage(Stage):
             generator=torch.Generator().manual_seed(self.cfg.run.seed),
         )
 
-        disc = VitsDiscriminator().to(dev).train()
-        opt_g = torch.optim.AdamW(model.parameters(), lr=tc.lr, betas=(0.8, 0.99))
-        opt_d = torch.optim.AdamW(disc.parameters(), lr=tc.lr, betas=(0.8, 0.99))
+        # Adapting the PRIOR side only (text encoder, duration predictor, flow) and
+        # freezing the waveform side (posterior encoder, HiFi-GAN decoder).
+        #
+        # This is the recipe after a measured failure, not a guess. Training everything
+        # adversarially from a RANDOMLY INITIALISED discriminator destroyed the voice:
+        # output amplitude fell ~12x (rms 0.152 -> 0.013), utterance durations halved,
+        # and intelligibility went from 0.16 to 1.04 WER. A fresh discriminator emits
+        # meaningless gradients for its first few hundred steps, and a pretrained
+        # vocoder has much further to fall than to climb. Real VITS runs survive this
+        # because they train both nets together for ~1M steps; 390 steps on 100 clips
+        # only gets the destructive half.
+        #
+        # Freezing the decoder also removes the adversarial and mel terms entirely
+        # (nothing generates a waveform), leaving KL + duration: teach the text side to
+        # predict what the audio side already encodes, and leave the vocoder alone.
+        prior_only = bool(getattr(tc, "freeze_vocoder", False))
+        if prior_only:
+            for module in (model.decoder, model.posterior_encoder):
+                for p in module.parameters():
+                    p.requires_grad_(False)
+            self.log.info("freeze_vocoder=true — adapting prior side only "
+                          "(no discriminator, no adversarial or mel loss)")
+
+        disc = None if prior_only else VitsDiscriminator().to(dev).train()
+        opt_g = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
+                                  lr=tc.lr, betas=(0.8, 0.99))
+        opt_d = (None if prior_only
+                 else torch.optim.AdamW(disc.parameters(), lr=tc.lr, betas=(0.8, 0.99)))
         mel_fb = mel_filterbank(self.cfg.ingest.target_sr, n_fft, _N_MELS, dev)
         seg_frames = _SEGMENT_FRAMES
         losses: list[dict] = []
@@ -270,32 +295,39 @@ class TrainStage(Stage):
                 z_p = model.flow(z, y_mask)
                 m_exp, logs_exp, attn = align_prior(z_p, m_p, logs_p, x_mask, y_mask)
 
-                z_slice, starts = rand_slice_segments(z, batch["spec_len"], seg_frames)
-                fake = model.decoder(z_slice)
-                real = torch.stack([wav[i, None, s * hop:(s + seg_frames) * hop]
-                                    for i, s in enumerate(starts.tolist())])
+                l_kl = kl_loss(z_p, logs_q, m_exp, logs_exp, y_mask) * _W_KL
+                l_dur = self._duration_loss(model, enc, batch, x_mask, attn)
+                loss_d = torch.zeros(())
+                l_mel = torch.zeros(())
 
-                # --- discriminator: never let generator grads flow through here
-                opt_d.zero_grad(set_to_none=True)
-                r_out, f_out, _, _ = disc(real, fake.detach())
-                loss_d = discriminator_loss(r_out, f_out)
-                loss_d.backward()
-                torch.nn.utils.clip_grad_norm_(disc.parameters(), _GRAD_CLIP)
-                opt_d.step()
+                if prior_only:
+                    loss_g = l_kl + l_dur
+                else:
+                    z_slice, starts = rand_slice_segments(z, batch["spec_len"],
+                                                          seg_frames)
+                    fake = model.decoder(z_slice)
+                    real = torch.stack([wav[i, None, s * hop:(s + seg_frames) * hop]
+                                        for i, s in enumerate(starts.tolist())])
+
+                    # --- discriminator: never let generator grads flow through here
+                    opt_d.zero_grad(set_to_none=True)
+                    r_out, f_out, _, _ = disc(real, fake.detach())
+                    loss_d = discriminator_loss(r_out, f_out)
+                    loss_d.backward()
+                    torch.nn.utils.clip_grad_norm_(disc.parameters(), _GRAD_CLIP)
+                    opt_d.step()
+
+                    _, f_out, r_feat, f_feat = disc(real, fake)
+                    mel_real = mel_from_linear(
+                        linear_spectrogram(real.squeeze(1), n_fft, hop, n_fft), mel_fb)
+                    mel_fake = mel_from_linear(
+                        linear_spectrogram(fake.squeeze(1), n_fft, hop, n_fft), mel_fb)
+                    l_mel = (mel_fake - mel_real).abs().mean() * _W_MEL
+                    loss_g = (l_mel + l_kl + feature_matching_loss(r_feat, f_feat)
+                              * _W_FM + generator_loss(f_out) + l_dur)
 
                 # --- generator
                 opt_g.zero_grad(set_to_none=True)
-                _, f_out, r_feat, f_feat = disc(real, fake)
-                mel_real = mel_from_linear(
-                    linear_spectrogram(real.squeeze(1), n_fft, hop, n_fft), mel_fb)
-                mel_fake = mel_from_linear(
-                    linear_spectrogram(fake.squeeze(1), n_fft, hop, n_fft), mel_fb)
-                l_mel = (mel_fake - mel_real).abs().mean() * _W_MEL
-                l_kl = kl_loss(z_p, logs_q, m_exp, logs_exp, y_mask) * _W_KL
-                l_fm = feature_matching_loss(r_feat, f_feat) * _W_FM
-                l_adv = generator_loss(f_out)
-                l_dur = self._duration_loss(model, enc, batch, x_mask, attn)
-                loss_g = l_mel + l_kl + l_fm + l_adv + l_dur
                 loss_g.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), _GRAD_CLIP)
                 opt_g.step()
@@ -331,7 +363,8 @@ class TrainStage(Stage):
             "epochs": tc.epochs, "n_train": len(ds), "steps": step,
             "voice_id": tc.voice_id,
             "final_losses": losses[-1] if losses else None,
-            "note": "full VITS adversarial fine-tune; discriminator is discarded",
+            "recipe": "prior-only (vocoder frozen)" if prior_only else "full adversarial",
+            "note": "discriminator is training scaffolding and is not shipped",
         }
 
     def _save_vits(self, model, disc, opt_g, opt_d, step, epoch, losses) -> None:
@@ -342,9 +375,10 @@ class TrainStage(Stage):
         import torch  # noqa: PLC0415
 
         model.save_pretrained(self.out_path)
-        torch.save({"disc": disc.state_dict(), "opt_g": opt_g.state_dict(),
-                    "opt_d": opt_d.state_dict(), "step": step, "epoch": epoch,
-                    "losses": losses},
+        torch.save({"disc": disc.state_dict() if disc is not None else None,
+                    "opt_g": opt_g.state_dict(),
+                    "opt_d": opt_d.state_dict() if opt_d is not None else None,
+                    "step": step, "epoch": epoch, "losses": losses},
                    self.out_path / _VITS_RESUME)
         self.log.info("checkpointed at epoch %d (step %d)", epoch, step)
 
@@ -362,9 +396,11 @@ class TrainStage(Stage):
         # Generator weights live in the HF checkpoint that sits beside this file.
         model.load_state_dict(
             VitsModel.from_pretrained(self.out_path).state_dict())
-        disc.load_state_dict(state["disc"])
+        if disc is not None and state.get("disc") is not None:
+            disc.load_state_dict(state["disc"])
         opt_g.load_state_dict(state["opt_g"])
-        opt_d.load_state_dict(state["opt_d"])
+        if opt_d is not None and state.get("opt_d") is not None:
+            opt_d.load_state_dict(state["opt_d"])
         losses.extend(state.get("losses", []))
         self.log.info("resuming VITS from epoch %d (step %d)",
                       state["epoch"], state["step"])

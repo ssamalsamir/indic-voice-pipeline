@@ -182,7 +182,7 @@ class EvaluateStage(Stage):
         spec = get_base_model(self.cfg.train.base_model)
         ckpt = self.cfg.run_dir / "checkpoint"
         synth = VitsSynthesiser(ckpt if ckpt.exists() else None, spec.hf_id,
-                                self.cfg.train.device)
+                                self.cfg.train.device, seed=self.cfg.run.seed)
         judge = self._asr_judge()
         out_dir = self.cfg.run_dir / "tts_audio"
 
@@ -207,6 +207,8 @@ class EvaluateStage(Stage):
             "asr_cer": round(M.corpus_cer(pairs), 4),
             "voice_is_finetuned": synth.is_finetuned,
             "asr_judge": self.cfg.eval.asr_judge_run or "registry base (untuned)",
+            "asr_judge_runtime": getattr(self, "_judge_runtime", "unknown"),
+            "synth_seed": self.cfg.run.seed,
             "by_slice": {},
         }
         # MCD needs reference audio AND a spectral lib; say so rather than emit a number
@@ -229,7 +231,20 @@ class EvaluateStage(Stage):
                 f"eval.asr_judge_run='{run}' but {ckpt} is missing — train it first or "
                 f"clear the field to judge with the untuned base model"
             )
+
+        # Prefer the judge's EXPORTED artifact when it has one: same weights, ~3x
+        # faster on CPU than the fp32 checkpoint on MPS. The judge is a measuring
+        # instrument, so what matters is that it is the same instrument across every
+        # run being compared — which is why the choice is logged into the report.
+        artifact = Path("runs") / run / "artifact" if run else None
+        if artifact is not None and (artifact / "model.bin").exists():
+            from pipeline.export import load_ct2_whisper  # noqa: PLC0415
+            self.log.info("intelligibility judge: %s (%s, ctranslate2 int8)", base, run)
+            self._judge_runtime = "ctranslate2-int8"
+            return load_ct2_whisper(artifact, self.cfg.run.language)
+
         self.log.info("intelligibility judge: %s (%s)", base, run or "untuned base")
+        self._judge_runtime = "pytorch-fp32"
         return WhisperTranscriber(ckpt, base, self.cfg.run.language, self.cfg.train.device)
 
     # -- verdict ---------------------------------------------------------------
