@@ -13,6 +13,7 @@ Produces:
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 from pipeline.modelcard import render_model_card
@@ -57,10 +58,19 @@ class PackageStage(Stage):
     def _export(self, ckpt: Path, artifact: Path) -> None:
         fmt = self.cfg.package.serve_format
         self.log.info("export format=%s quantise=%s", fmt, self.cfg.package.quantise)
-        # Wire per-format export: ctranslate2 (whisper), onnx (vits), torch.save, gguf.
-        # Kept as a declared no-op stub so the spine runs; fill in Week 7.
-        (artifact / "EXPORT_TODO.txt").write_text(
-            f"export {ckpt} as {fmt}, quantise={self.cfg.package.quantise}\n"
+
+        if fmt == "ctranslate2":
+            from pipeline.export import export_whisper_ct2  # noqa: PLC0415
+            manifest = export_whisper_ct2(ckpt, self._base_hf_id(), artifact,
+                                          self.cfg.package.quantise, self.log)
+            dump_json(self.cfg.run_dir / "export.json", manifest)
+            return
+
+        # torch = "serve the checkpoint as-is", which is what the TTS track does: VITS
+        # is already one forward pass at RTF 0.06, so there is nothing to buy here and
+        # a conversion would only add a format to keep in sync.
+        (artifact / "SERVE_AS_IS.txt").write_text(
+            f"serve {ckpt} directly via pipeline.infer / pipeline.tts (format={fmt})\n"
         )
 
     # Enough clips for a stable p95 without turning `package` into another eval run.
@@ -79,8 +89,12 @@ class PackageStage(Stage):
         import time  # noqa: PLC0415
 
         target = self.cfg.package.rtf_target
+        # `train.device` is where the model was TRAINED, which for the Kaggle runs is a
+        # CUDA GPU that has nothing to do with the box being timed. Default to the
+        # training device only until the serving runtime tells us what it really is.
+        self._runtime = self.cfg.train.device
         unmeasured = {
-            "hardware": self.cfg.train.device, "rtf": None,
+            "hardware": self._runtime, "rtf": None,
             "p50_ms": None, "p95_ms": None, "gate": "UNMEASURED", "measured": False,
         }
 
@@ -91,7 +105,7 @@ class PackageStage(Stage):
             return unmeasured
 
         try:
-            run_once = self._timed_call(is_stt)
+            run_once = self._timed_call(is_stt, artifact)
         except Exception as exc:  # noqa: BLE001 - packaging must not die on RTF
             self.log.warning("could not load model for RTF (%s) — leaving unmeasured", exc)
             return unmeasured
@@ -111,10 +125,25 @@ class PackageStage(Stage):
             self.log.warning("clips carry no duration — RTF left unmeasured")
             return unmeasured
 
-        rtf = (sum(latencies) / 1000) / audio_s
-        return {
-            "hardware": self.cfg.train.device,
+        rtf_clip = (sum(latencies) / 1000) / audio_s
+        stream = self._stream_rtf(run_once, rows) if is_stt else None
+
+        # Both numbers are kept because the cheap assumption about Whisper is wrong.
+        # Whisper's encoder does run a fixed 30s window, which suggests short clips
+        # merely pay for padding and that batching to 30s would be far cheaper per
+        # second of audio. Measured, it is the other way round: streaming 30s chunks
+        # came out SLOWER per second (2.07) than 4s clips (1.69), because decoding is
+        # autoregressive and a 30s chunk carries ~8x the tokens. Encoder padding is
+        # not the bottleneck; decode is.
+        #
+        # So the gate uses the per-clip figure — the plain definition, and the one
+        # matching how the eval set is scored — and the stream figure rides along as
+        # evidence rather than being quietly dropped for being inconvenient.
+        rtf = rtf_clip
+        out = {
+            "hardware": self._runtime,
             "rtf": round(rtf, 4),
+            "rtf_per_clip": round(rtf_clip, 4),
             "p50_ms": round(statistics.median(latencies), 1),
             "p95_ms": round(sorted(latencies)[max(0, int(len(latencies) * 0.95) - 1)], 1),
             "n_clips": len(latencies),
@@ -122,6 +151,67 @@ class PackageStage(Stage):
             "gate": "PASS" if rtf <= target else "FAIL",
             "measured": True,
         }
+        if stream:
+            out["stream"] = stream
+        return out
+
+    # Whisper's encoder window. Audio is served in chunks this long because a shorter
+    # chunk costs exactly the same to encode.
+    _WINDOW_S = 30.0
+
+    def _stream_rtf(self, run_once, rows: list[dict]) -> dict | None:
+        """Throughput when audio is served in encoder-sized chunks.
+
+        Concatenates the same clips into ~30s windows and times those. Same model,
+        same audio, same machine — the only thing that changes is that the encoder is
+        no longer mostly transcribing silence.
+        """
+        import time  # noqa: PLC0415
+
+        try:
+            import numpy as np  # noqa: PLC0415
+            import soundfile as sf  # noqa: PLC0415
+
+            from pipeline.data import load_audio  # noqa: PLC0415
+        except ImportError as exc:
+            self.log.warning("stream RTF needs numpy/soundfile (%s) — per-clip only", exc)
+            return None
+
+        sr = self.cfg.ingest.target_sr
+        chunk_dir = self.cfg.run_dir / "rtf_chunks"
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            buf, chunks = [], []
+            for row in rows:
+                buf.append(load_audio(row["audio_path"], sr))
+                if sum(len(b) for b in buf) >= self._WINDOW_S * sr:
+                    chunks.append(np.concatenate(buf))
+                    buf = []
+            if buf:
+                chunks.append(np.concatenate(buf))
+            if not chunks:
+                return None
+
+            paths = []
+            for i, audio in enumerate(chunks):
+                p = chunk_dir / f"chunk_{i:03d}.wav"
+                sf.write(p, audio, sr)
+                paths.append((p, len(audio) / sr))
+
+            run_once({"audio_path": str(paths[0][0])})  # warm-up at the new shape
+            elapsed, audio_s = 0.0, 0.0
+            for path, dur in paths:
+                t0 = time.perf_counter()
+                run_once({"audio_path": str(path)})
+                elapsed += time.perf_counter() - t0
+                audio_s += dur
+            return {"rtf": round(elapsed / audio_s, 4), "n_chunks": len(paths),
+                    "audio_s": round(audio_s, 1), "window_s": self._WINDOW_S}
+        except Exception as exc:  # noqa: BLE001 - never fail packaging on a metric
+            self.log.warning("stream RTF failed (%s) — per-clip only", exc)
+            return None
+        finally:
+            shutil.rmtree(chunk_dir, ignore_errors=True)
 
     def _rtf_clips(self, need_audio: bool = True) -> list[dict]:
         """Prefer the held-out eval rows; fall back to the train manifest.
@@ -143,10 +233,15 @@ class PackageStage(Stage):
                 return rows[:self._RTF_CLIPS]
         return []
 
-    def _timed_call(self, is_stt: bool):
-        """Return f(row) -> seconds of audio produced (TTS) or 0.0 (STT)."""
+    def _timed_call(self, is_stt: bool, artifact: Path):
+        """Return f(row) -> seconds of audio produced (TTS) or 0.0 (STT).
+
+        Times the EXPORTED artifact whenever there is one. Timing the training
+        checkpoint instead would report a latency nobody ever runs in production —
+        the number has to describe the thing that ships.
+        """
         if is_stt:
-            transcriber = self._build_transcriber()
+            transcriber = self._serving_transcriber(artifact)
 
             def stt(row):
                 transcriber.transcribe(row["audio_path"], self.cfg.ingest.target_sr,
@@ -167,21 +262,34 @@ class PackageStage(Stage):
             return len(audio) / synth.sampling_rate
         return tts
 
-    def _build_transcriber(self):
-        import json  # noqa: PLC0415
+    def _serving_transcriber(self, artifact: Path):
+        """The exported artifact if one was produced, else the raw checkpoint."""
+        if (artifact / "model.bin").exists():
+            from pipeline.export import load_ct2_whisper  # noqa: PLC0415
+            # CTranslate2 has no Metal backend, so the exported model runs on CPU
+            # whatever the training device was. Record that, not the training device.
+            self._runtime = "cpu (ctranslate2 int8)"
+            self.log.info("timing the EXPORTED artifact (ctranslate2, cpu int8)")
+            return load_ct2_whisper(artifact, self.cfg.run.language)
 
         from pipeline.infer import WhisperTranscriber  # noqa: PLC0415
+        self.log.info("no exported artifact — timing the raw checkpoint")
+        return WhisperTranscriber(self.cfg.run_dir / "checkpoint", self._base_hf_id(),
+                                  self.cfg.run.language, device=self.cfg.train.device)
+
+    def _base_hf_id(self) -> str:
+        """Prefer what training actually used; the config is only a fallback, since a
+        rescued checkpoint can outlive the config that produced it."""
+        import json  # noqa: PLC0415
+
         from pipeline.registry import get_base_model  # noqa: PLC0415
 
-        # Prefer what training actually used; the config is only a fallback, since a
-        # rescued checkpoint can outlive the config that produced it.
         meta_path = self.cfg.run_dir / "checkpoint" / "train_meta.json"
-        base = None
         if meta_path.exists():
             base = json.loads(meta_path.read_text()).get("base_hf_id")
-        base = base or get_base_model(self.cfg.train.base_model).hf_id
-        return WhisperTranscriber(self.cfg.run_dir / "checkpoint", base,
-                                  self.cfg.run.language, device=self.cfg.train.device)
+            if base:
+                return base
+        return get_base_model(self.cfg.train.base_model).hf_id
 
     def _load_metrics(self) -> dict:
         m = self.cfg.run_dir / "metrics.json"

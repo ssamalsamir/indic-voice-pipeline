@@ -51,9 +51,15 @@ train:
   lora:
     enabled: true
   voice_id: mms_hin_default
-  epochs: 200
+  # 30 epochs over 100 utterances (~390 steps), not the 200 a from-scratch VITS wants.
+  # This is an ADAPTATION of an already-trained voice: the pretrained model starts near
+  # a good optimum, and long training on 100 clips walks away from it into memorisation.
+  epochs: 30
   lr: 2.0e-4
-  batch_size: 16
+  # 8, not 16: the posterior encoder and flow run over FULL-length spectrograms (up to
+  # ~1000 frames here) before anything gets sliced, and that is the memory peak on a
+  # 16GB M4. Only the vocoder sees short windows.
+  batch_size: 8
 
 eval:
   metrics: [asr_wer, mcd]

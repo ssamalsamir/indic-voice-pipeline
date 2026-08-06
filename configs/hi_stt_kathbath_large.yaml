@@ -64,6 +64,9 @@ eval:
     cer: 0.08
 
 package:
-  quantise: false
-  serve_format: torch
+  # int8 CTranslate2, not the raw LoRA checkpoint. The checkpoint measured RTF 4.47
+  # against a 1.0 bar on this hardware, so "ship what we trained" was not an option:
+  # merging the adapter and quantising is what makes the model deployable on-prem.
+  quantise: true
+  serve_format: ctranslate2
   rtf_target: 1.0
