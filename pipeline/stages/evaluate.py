@@ -136,7 +136,14 @@ class EvaluateStage(Stage):
         )
 
     def _transcribe(self, audio_path: str) -> str:
-        return self._transcriber().transcribe(audio_path, self.cfg.ingest.target_sr)
+        # Beam search multiplies decoder activation memory by num_beams. On a CUDA box
+        # that buys 1-2 WER points for a little time; on a 16GB Mac running a large
+        # model it is what pushes the process into swap, where it stalls forever and
+        # returns no number at all. A greedy result beats a beam result you never get.
+        beams = 1 if self.cfg.train.device == "mps" else 5
+        return self._transcriber().transcribe(
+            audio_path, self.cfg.ingest.target_sr, num_beams=beams
+        )
 
     def _transcriber(self):
         """Lazily build + cache the transcriber (loads the adapter once per eval run)."""

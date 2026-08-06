@@ -92,4 +92,11 @@ class WhisperTranscriber:
             ids = self.model.generate(inputs, language=self._lang_name,
                                       task="transcribe",
                                       max_new_tokens=225, num_beams=num_beams)
-        return self.processor.batch_decode(ids, skip_special_tokens=True)[0].strip()
+        out = self.processor.batch_decode(ids, skip_special_tokens=True)[0].strip()
+        # MPS's caching allocator holds freed blocks, so footprint grows clip over clip
+        # until a 16GB machine pages the model out and lands in uninterruptible I/O
+        # wait — alive, near-zero CPU, never finishing. train.py already fights this per
+        # step; inference needs it just as much because eval is a long loop.
+        if self.device == "mps":
+            self._torch.mps.empty_cache()
+        return out
