@@ -1,0 +1,55 @@
+"""Reusable TTS synthesis — used by the evaluate stage and on-prem serving.
+
+Mirrors pipeline/infer.py on the STT side: one class so evaluation and serving cannot
+drift apart. Heavy imports stay lazy so the spine imports without torch.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+
+class VitsSynthesiser:
+    """facebook/mms-tts-* family. Small, low-latency, MPS-friendly.
+
+    VITS is non-autoregressive, so one forward pass yields the whole waveform: no
+    generate() loop, no beam search, and none of the memory growth that makes Whisper
+    eval on MPS delicate.
+    """
+
+    def __init__(self, checkpoint: Path | None, base_hf_id: str, device: str = "mps"):
+        import torch  # noqa: PLC0415
+        from transformers import VitsModel, VitsTokenizer  # noqa: PLC0415
+
+        # A LoRA adapter dir is optional: with none, this is the honest baseline voice
+        # rather than a fine-tuned one, and the model card must say which.
+        src = checkpoint if (checkpoint and (checkpoint / "adapter_config.json").exists()) else None
+        self.tokenizer = VitsTokenizer.from_pretrained(base_hf_id)
+        model = VitsModel.from_pretrained(base_hf_id)
+        if src is not None:
+            from peft import PeftModel  # noqa: PLC0415
+            model = PeftModel.from_pretrained(model, src)
+        self.is_finetuned = src is not None
+        self.model = model.to(device).eval()
+        self.device = device
+        self._torch = torch
+        self.sampling_rate = int(model.config.sampling_rate)
+
+    def synthesise(self, text: str):
+        """Return a float32 mono waveform at self.sampling_rate."""
+        inputs = self.tokenizer(text, return_tensors="pt").to(self.device)
+        with self._torch.no_grad():
+            wav = self.model(**inputs).waveform
+        out = wav.squeeze().float().cpu().numpy()
+        if self.device == "mps":
+            self._torch.mps.empty_cache()
+        return out
+
+    def to_wav(self, text: str, path: Path):
+        import soundfile as sf  # noqa: PLC0415
+
+        audio = self.synthesise(text)
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        sf.write(path, audio, self.sampling_rate)
+        return path, len(audio) / self.sampling_rate

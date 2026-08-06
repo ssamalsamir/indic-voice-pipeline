@@ -121,6 +121,18 @@ class EvalCfg(BaseModel):
     )
     # mentor-agreed bars; a run is flagged pass/fail against these
     thresholds: dict[str, float] = Field(default_factory=dict)
+    asr_judge_run: str | None = Field(
+        None,
+        description="TTS only: run name whose STT checkpoint scores intelligibility "
+                    "(synthesise -> transcribe -> WER). None uses the registry base "
+                    "model untuned. Naming the judge in the config keeps the number "
+                    "reproducible — an intelligibility score is meaningless unless you "
+                    "know which ears measured it.",
+    )
+    asr_judge_hf_id: str | None = Field(
+        None, description="TTS only: base model for the judge. Defaults to the Hindi "
+                          "STT base in the registry.",
+    )
 
 
 class PackageCfg(BaseModel):

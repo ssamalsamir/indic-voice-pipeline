@@ -28,7 +28,13 @@ class EvaluateStage(Stage):
     def run(self) -> Path:
         ckpt = self.cfg.run_dir / "checkpoint"
         if not ckpt.exists():
-            raise FileNotFoundError("run `train` first — checkpoint missing")
+            # STT has nothing to score without a fine-tune. TTS does: the released voice
+            # is a legitimate baseline, and measuring it is how you learn whether
+            # fine-tuning is even needed. The report carries voice_is_finetuned=false so
+            # the number is never mistaken for a tuned result.
+            if self.cfg.run.track.value == "stt":
+                raise FileNotFoundError("run `train` first — checkpoint missing")
+            self.log.warning("no checkpoint — scoring the BASE voice as a baseline")
 
         if self.cfg.run.track.value == "stt":
             report = self._eval_stt()
@@ -160,10 +166,71 @@ class EvaluateStage(Stage):
     # -- TTS -------------------------------------------------------------------
 
     def _eval_tts(self) -> dict:
-        raise NotImplementedError(
-            "TTS eval: synthesise held-out text, run ASR-WER intelligibility + MCD, "
-            "merge MOS panel CSV. Metric maths reuses pipeline.metrics."
-        )
+        """Intelligibility: synthesise held-out text, transcribe it, score the round trip.
+
+        A TTS model that sounds fine but garbles words fails the only property that can
+        be measured without a listening panel. The ASR judge is named in the config
+        rather than inferred, because an intelligibility number means nothing unless you
+        know which ears produced it — a weak judge flatters the voice.
+
+        The judge's OWN error rate is the noise floor: our Hindi STT sits at ~0.07 WER
+        on real speech, so an asr_wer near that is the ceiling, not a defect.
+        """
+        from pipeline.registry import get_base_model  # noqa: PLC0415
+        from pipeline.tts import VitsSynthesiser  # noqa: PLC0415
+
+        spec = get_base_model(self.cfg.train.base_model)
+        ckpt = self.cfg.run_dir / "checkpoint"
+        synth = VitsSynthesiser(ckpt if ckpt.exists() else None, spec.hf_id,
+                                self.cfg.train.device)
+        judge = self._asr_judge()
+        out_dir = self.cfg.run_dir / "tts_audio"
+
+        pairs, rows = [], []
+        for i, row in enumerate(read_jsonl(self._ensure_eval_manifest())):
+            ref = row["text"]
+            if not ref.strip():
+                continue
+            wav, dur = synth.to_wav(ref, out_dir / f"tts_{i:05d}.wav")
+            hyp = self._norm(judge.transcribe(str(wav), synth.sampling_rate, num_beams=1))
+            pairs.append((self._norm(ref), hyp))
+            rows.append({"id": row.get("id", i), "text": ref, "asr": hyp,
+                         "wav": str(wav), "duration_s": round(dur, 3)})
+
+        if not pairs:
+            raise ValueError("no usable held-out text to synthesise")
+
+        dump_json(self.cfg.run_dir / "tts_intelligibility.json", {"rows": rows})
+        report = {
+            "track": "tts", "n": len(pairs),
+            "asr_wer": round(M.corpus_wer(pairs), 4),
+            "asr_cer": round(M.corpus_cer(pairs), 4),
+            "voice_is_finetuned": synth.is_finetuned,
+            "asr_judge": self.cfg.eval.asr_judge_run or "registry base (untuned)",
+            "by_slice": {},
+        }
+        # MCD needs reference audio AND a spectral lib; say so rather than emit a number
+        # that was never computed — a fabricated metric is worse than a declared gap.
+        report["mcd"] = None
+        report["mcd_note"] = ("not computed: requires reference audio aligned to the "
+                              "synthesised text plus librosa; see PLAN.md Wk5-6")
+        return report
+
+    def _asr_judge(self):
+        """The STT model that scores intelligibility. Config-named, never guessed."""
+        from pipeline.infer import WhisperTranscriber  # noqa: PLC0415
+        from pipeline.registry import get_base_model  # noqa: PLC0415
+
+        base = self.cfg.eval.asr_judge_hf_id or get_base_model("whisper-hindi-large-v2").hf_id
+        run = self.cfg.eval.asr_judge_run
+        ckpt = Path("runs") / run / "checkpoint" if run else None
+        if ckpt is not None and not ckpt.exists():
+            raise FileNotFoundError(
+                f"eval.asr_judge_run='{run}' but {ckpt} is missing — train it first or "
+                f"clear the field to judge with the untuned base model"
+            )
+        self.log.info("intelligibility judge: %s (%s)", base, run or "untuned base")
+        return WhisperTranscriber(ckpt, base, self.cfg.run.language, self.cfg.train.device)
 
     # -- verdict ---------------------------------------------------------------
 

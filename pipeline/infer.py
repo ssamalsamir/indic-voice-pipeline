@@ -12,7 +12,7 @@ from pipeline.data import WHISPER_LANG, load_audio
 
 
 class WhisperTranscriber:
-    def __init__(self, checkpoint: Path, base_hf_id: str, language: str,
+    def __init__(self, checkpoint: Path | None, base_hf_id: str, language: str,
                  device: str = "mps"):
         import torch  # noqa: PLC0415
         from peft import PeftModel  # noqa: PLC0415
@@ -20,17 +20,18 @@ class WhisperTranscriber:
 
         self.device = device
         self.language = language
+        # checkpoint=None means "untuned base": legitimate when this model is a measuring
+        # instrument (the TTS intelligibility judge) rather than the thing under test.
+        has = (lambda f: checkpoint is not None and (checkpoint / f).exists())
         self.processor = WhisperProcessor.from_pretrained(
-            checkpoint if (checkpoint / "preprocessor_config.json").exists() else base_hf_id,
+            checkpoint if has("preprocessor_config.json") else base_hf_id,
             language=WHISPER_LANG.get(language, language),
             task="transcribe",
         )
         base = WhisperForConditionalGeneration.from_pretrained(base_hf_id)
         # adapter dir contains adapter_config.json when LoRA was used
-        if (checkpoint / "adapter_config.json").exists():
-            self.model = PeftModel.from_pretrained(base, checkpoint)
-        else:
-            self.model = base
+        self.model = (PeftModel.from_pretrained(base, checkpoint)
+                      if has("adapter_config.json") else base)
         self.model.to(device).eval()
         # from_pretrained honours the checkpoint's stored dtype, so large-v3 loads as
         # fp16 while the feature extractor always emits fp32. Feeding one to the other

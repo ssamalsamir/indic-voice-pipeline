@@ -1,0 +1,68 @@
+# Hindi TTS intelligibility (acceptance #7/#8, TTS half).
+#
+# Uses FLEURS rather than IndicVoices because FLEURS is ungated and already on disk;
+# the TTS track needs held-out TEXT to synthesise, and any clean Hindi text serves.
+#
+# The judge is our own STT model (WER 0.0675 on Kathbath). That matters: an
+# intelligibility score is only as trustworthy as the ears measuring it, and a weak
+# judge flatters the voice. The judge's own error rate is the noise floor here, so an
+# asr_wer near 0.07 means "as intelligible as real human speech is to this model",
+# not a defect in the voice.
+#
+# NOTE ON HONESTY: train for VITS is not implemented (PLAN.md Wk5-6), so this scores
+# the BASE facebook/mms-tts-hin voice, not a fine-tuned one. The report carries
+# voice_is_finetuned=false and the model card says so.
+run:
+  name: hi_tts_fleurs
+  track: tts
+  language: hi
+  seed: 1337
+
+data:
+  dataset: fleurs
+  hf_path: google/fleurs
+  hf_config: hi_in
+  licence: CC-BY-4.0
+  consent: "No voice cloning: synthesis uses the released facebook/mms-tts-hin voice, not a cloned speaker."
+  train_split: train
+  eval_split: validation
+  max_train_utts: 100
+  max_eval_utts: 39         # two model passes per clip (synthesise + transcribe)
+
+ingest:
+  target_sr: 16000          # mms-tts-hin emits 16k; matching avoids a resample
+  mono: true
+
+clean:
+  canonical_script: Devanagari
+  trim_silence: true
+  min_duration_s: 0.5
+  max_duration_s: 30.0
+  normalise_numerals: true
+  keep_code_mixing: true
+
+align:
+  aligner: none             # intelligibility needs no forced alignment
+
+train:
+  base_model: vits-hi
+  device: mps
+  precision: fp32
+  lora:
+    enabled: true
+  voice_id: mms_hin_default
+  epochs: 200
+  lr: 2.0e-4
+  batch_size: 16
+
+eval:
+  metrics: [asr_wer, mcd]
+  slices: []
+  asr_judge_run: hi_stt_kathbath_large   # name the ears, keep the number reproducible
+  thresholds:
+    asr_wer: 0.30           # intelligibility bar: a listener-usable voice, not ASR parity
+
+package:
+  quantise: false
+  serve_format: torch
+  rtf_target: 1.0
