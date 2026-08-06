@@ -16,18 +16,35 @@ from pipeline.data import load_audio
 from pipeline.utils.io import read_jsonl
 
 
+def _audio_is_readable(path: str) -> bool:
+    """Can this actually be opened? Reads the header only, not the samples."""
+    try:
+        import soundfile as sf  # noqa: PLC0415
+        return sf.info(path).frames > 0
+    except Exception:  # noqa: BLE001 - any failure to read means unusable
+        return False
+
+
 class VitsManifestDataset(torch.utils.data.Dataset):
     """One manifest row -> (input_ids, waveform, linear spectrogram).
 
-    Rows with unreadable audio are dropped at construction rather than raising
-    mid-epoch: losing one clip of a hundred is not worth killing an hour of training,
-    but a silent zero-length tensor reaching the loss would be.
+    Rows whose audio cannot be opened are dropped at construction rather than raising
+    mid-epoch: losing one clip of a hundred is not worth killing an hour of unattended
+    training, but a silent zero-length tensor reaching the loss would be worse than
+    either. The check opens each file's header once, which costs milliseconds against
+    a run measured in hours.
     """
 
     def __init__(self, manifest: Path, tokenizer, target_sr: int,
-                 n_fft: int, hop: int) -> None:
-        self.rows = [r for r in read_jsonl(manifest)
-                     if r.get("audio_path") and (r.get("text") or "").strip()]
+                 n_fft: int, hop: int, log=None) -> None:
+        rows = [r for r in read_jsonl(manifest)
+                if r.get("audio_path") and (r.get("text") or "").strip()]
+        self.rows = [r for r in rows if _audio_is_readable(r["audio_path"])]
+        dropped = len(rows) - len(self.rows)
+        if dropped and log is not None:
+            # Say how many, always. A silent drop turns "my corpus is 100 clips" into
+            # a number nobody can reconcile with the manifest.
+            log.warning("dropped %d/%d rows with unreadable audio", dropped, len(rows))
         self.tokenizer = tokenizer
         self.sr, self.n_fft, self.hop = target_sr, n_fft, hop
 

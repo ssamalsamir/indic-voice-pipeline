@@ -35,6 +35,9 @@ _N_MELS = 80
 # running HiFi-GAN over a whole utterance every step does not fit in memory.
 _SEGMENT_FRAMES = 32
 _GRAD_CLIP = 5.0
+# Discriminator + both optimiser states. Deleted on clean completion: it is training
+# scaffolding, several times the generator's size, and nothing serves it.
+_VITS_RESUME = "vits_resume.pt"
 
 
 class TrainStage(Stage):
@@ -231,7 +234,7 @@ class TrainStage(Stage):
         n_fft = (cfg_m.spectrogram_bins - 1) * 2
 
         ds = VitsManifestDataset(manifest, tok, self.cfg.ingest.target_sr,
-                                 n_fft=n_fft, hop=hop)
+                                 n_fft=n_fft, hop=hop, log=self.log)
         if len(ds) == 0:
             raise ValueError("no usable (audio,text) rows in manifest")
         loader = torch.utils.data.DataLoader(
@@ -245,11 +248,10 @@ class TrainStage(Stage):
         mel_fb = mel_filterbank(self.cfg.ingest.target_sr, n_fft, _N_MELS, dev)
         seg_frames = _SEGMENT_FRAMES
         losses: list[dict] = []
-        step = 0
+        step, start_epoch = self._resume_vits(model, disc, opt_g, opt_d, losses)
+        total_epochs = math.ceil(tc.epochs)  # float epochs: HF takes them, this loop can't
 
-        # `epochs` is a float because HF Trainer takes fractional epochs; this
-        # hand-written loop cannot, so round up rather than truncate 0.5 to nothing.
-        for epoch in range(math.ceil(tc.epochs)):
+        for epoch in range(start_epoch, total_epochs):
             for batch in loader:
                 batch = {k: v.to(dev) for k, v in batch.items()}
                 wav, spec_lin = batch["waveform"], batch["spectrogram"]
@@ -309,9 +311,20 @@ class TrainStage(Stage):
                                   "mel=%(mel).4f kl=%(kl).4f dur=%(dur).4f", row)
                 step += 1
 
+            # Checkpoint every epoch, not only at the end. The STT path already does
+            # this and the TTS path has the same risk profile: a multi-hour adversarial
+            # loop on a laptop that may sleep, or a hosted runner that may be evicted.
+            # This project has already lost a full run to a Modal billing-limit kill,
+            # so a loop whose only save is after the last step is a loop that throws
+            # away everything on any interruption.
+            self._save_vits(model, disc, opt_g, opt_d, step, epoch + 1, losses)
+
         model.save_pretrained(self.out_path)
         tok.save_pretrained(self.out_path)
         dump_json(self.out_path / "loss_curve.json", {"rows": losses})
+        # The discriminator exists only to shape the generator; nothing serves it, and
+        # it is ~4x the generator on disk.
+        (self.out_path / _VITS_RESUME).unlink(missing_ok=True)
         return {
             "track": "tts", "base_model": spec.key, "base_hf_id": spec.hf_id,
             "arch": spec.arch, "device": dev, "lora": False,
@@ -321,6 +334,42 @@ class TrainStage(Stage):
             "note": "full VITS adversarial fine-tune; discriminator is discarded",
         }
 
+    def _save_vits(self, model, disc, opt_g, opt_d, step, epoch, losses) -> None:
+        """Snapshot everything needed to continue: both networks AND both optimiser
+        states. Adam's moments are not incidental — resuming with fresh moments after
+        a GAN has reached equilibrium destabilises it, so dropping them would make
+        "resume" quietly mean "restart with a warm generator"."""
+        import torch  # noqa: PLC0415
+
+        model.save_pretrained(self.out_path)
+        torch.save({"disc": disc.state_dict(), "opt_g": opt_g.state_dict(),
+                    "opt_d": opt_d.state_dict(), "step": step, "epoch": epoch,
+                    "losses": losses},
+                   self.out_path / _VITS_RESUME)
+        self.log.info("checkpointed at epoch %d (step %d)", epoch, step)
+
+    def _resume_vits(self, model, disc, opt_g, opt_d, losses) -> tuple[int, int]:
+        """Restore a previous run if one is sitting in the run dir. Returns
+        (step, start_epoch); (0, 0) when starting fresh."""
+        import torch  # noqa: PLC0415
+        from transformers import VitsModel  # noqa: PLC0415
+
+        state_path = self.out_path / _VITS_RESUME
+        if not state_path.exists():
+            return 0, 0
+        state = torch.load(state_path, map_location=self.cfg.train.device,
+                           weights_only=False)
+        # Generator weights live in the HF checkpoint that sits beside this file.
+        model.load_state_dict(
+            VitsModel.from_pretrained(self.out_path).state_dict())
+        disc.load_state_dict(state["disc"])
+        opt_g.load_state_dict(state["opt_g"])
+        opt_d.load_state_dict(state["opt_d"])
+        losses.extend(state.get("losses", []))
+        self.log.info("resuming VITS from epoch %d (step %d)",
+                      state["epoch"], state["step"])
+        return int(state["step"]), int(state["epoch"])
+
     @staticmethod
     def _duration_loss(model, enc, batch, x_mask, attn):
         """Teach the duration predictor the alignment MAS just found.
@@ -329,12 +378,30 @@ class TrainStage(Stage):
         there is no audio, so the predictor's output is the only thing deciding how
         long each token is spoken. Train it badly and the voice stays intelligible in
         teacher-forced training and rushes or drawls at inference.
+
+        The two predictor variants have DIFFERENT contracts, not just different
+        internals. The stochastic one is a flow: hand it the durations and it returns
+        a negative log-likelihood you minimise directly. The deterministic one is a
+        regressor with no `durations` argument at all — it returns a log-duration
+        prediction, so the loss has to be formed here. Calling the stochastic API on a
+        deterministic checkpoint raises TypeError, which is why this branches on the
+        config rather than on what today's single registered model happens to be.
         """
         import torch  # noqa: PLC0415
         durations = attn.sum(1).unsqueeze(1)          # [B,1,T_text] frames per token
         hidden = enc.last_hidden_state.transpose(1, 2).detach()
-        nll = model.duration_predictor(hidden, x_mask, durations=durations)
-        return torch.sum(nll.float()) / torch.sum(x_mask).clamp_min(1.0)
+
+        if model.config.use_stochastic_duration_prediction:
+            nll = model.duration_predictor(hidden, x_mask, durations=durations)
+            return torch.sum(nll.float()) / torch.sum(x_mask).clamp_min(1.0)
+
+        # Deterministic: MSE in LOG duration, because duration error is proportional,
+        # not absolute — being two frames out on a long vowel is not the same mistake
+        # as being two frames out on a stop consonant.
+        log_pred = model.duration_predictor(hidden, x_mask)
+        log_target = torch.log(durations.clamp_min(1e-6)) * x_mask
+        return (torch.sum(((log_pred - log_target) * x_mask) ** 2)
+                / torch.sum(x_mask).clamp_min(1.0))
 
     # -- helpers ---------------------------------------------------------------
 

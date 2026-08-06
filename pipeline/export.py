@@ -61,10 +61,14 @@ def export_whisper_ct2(checkpoint: Path, base_hf_id: str, artifact: Path,
     log.info("converting to ctranslate2 (quantization=%s)", quantization)
     if artifact.exists():
         shutil.rmtree(artifact)
-    ctranslate2.converters.TransformersConverter(
-        str(merged), copy_files=copy, load_as_float16=False,
-    ).convert(str(artifact), quantization=quantization, force=True)
-    shutil.rmtree(merged, ignore_errors=True)
+    try:
+        ctranslate2.converters.TransformersConverter(
+            str(merged), copy_files=copy, load_as_float16=False,
+        ).convert(str(artifact), quantization=quantization, force=True)
+    finally:
+        # Several GB of merged fp32 weights. Without the finally, a failed conversion
+        # leaves them behind and the next run silently needs that much more disk.
+        shutil.rmtree(merged, ignore_errors=True)
 
     size_mb = round(sum(p.stat().st_size for p in artifact.rglob("*") if p.is_file())
                     / 1e6, 1)
