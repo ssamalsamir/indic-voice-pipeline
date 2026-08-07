@@ -11,7 +11,42 @@ from pipeline.config import PipelineConfig
 from pipeline.registry import get_base_model, get_dataset
 
 
-def render_model_card(cfg: PipelineConfig, metrics: dict, latency: dict) -> str:
+def _method_lines(cfg: PipelineConfig, meta: dict) -> str:
+    """Describe what training ACTUALLY did, from train_meta.json.
+
+    The config records intent, and the two diverge: the TTS track carries
+    `lora.enabled: true` in its config but VITS is fine-tuned in full, so a card
+    rendered from the config alone claimed a LoRA adapter that does not exist. A
+    model card that misreports the method is worse than one that omits it, because
+    it is the artifact someone reads instead of the code.
+    """
+    if not meta:
+        return (f"- Method: per config (run not yet trained)\n"
+                f"- LoRA requested: enabled={cfg.train.lora.enabled}, "
+                f"r={cfg.train.lora.r}, alpha={cfg.train.lora.alpha}")
+
+    if meta.get("lora"):
+        method = (f"LoRA adapter (r={cfg.train.lora.r}, alpha={cfg.train.lora.alpha}, "
+                  f"targets={list(get_base_model(cfg.train.base_model).lora_targets or [])})")
+    else:
+        method = f"full fine-tune — {meta.get('recipe', 'all weights trainable')}"
+
+    lines = [f"- Method: {method}",
+             f"- Trained: {meta.get('steps', '?')} steps over "
+             f"{meta.get('epochs', '?')} epochs on {meta.get('n_train', '?')} utterances",
+             f"- Device: {meta.get('device', cfg.train.device)}  ·  "
+             f"Precision: {cfg.train.precision}"]
+    if meta.get("train_loss") is not None:
+        lines.append(f"- Final train loss: {meta['train_loss']}")
+    if meta.get("final_losses"):
+        lines.append(f"- Final losses: {meta['final_losses']}")
+    if meta.get("note"):
+        lines.append(f"- Note: {meta['note']}")
+    return "\n".join(lines)
+
+
+def render_model_card(cfg: PipelineConfig, metrics: dict, latency: dict,
+                      meta: dict | None = None) -> str:
     base = get_base_model(cfg.train.base_model)
     ds = get_dataset(cfg.data.dataset)
     consent = cfg.data.consent or "n/a (no voice cloning)"
@@ -24,8 +59,7 @@ def render_model_card(cfg: PipelineConfig, metrics: dict, latency: dict) -> str:
 
 ## Base model (fine-tuned, not trained from scratch)
 - **{base.key}** — `{base.hf_id}` ({base.arch})
-- LoRA: enabled={cfg.train.lora.enabled}, r={cfg.train.lora.r}, alpha={cfg.train.lora.alpha}
-- Device: {cfg.train.device}  ·  Precision: {cfg.train.precision}
+{_method_lines(cfg, meta or {})}
 
 ## Data & governance
 - **Dataset:** {ds.key} (`{ds.hf_id}`)

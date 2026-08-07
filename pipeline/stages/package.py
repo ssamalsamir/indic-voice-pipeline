@@ -47,7 +47,8 @@ class PackageStage(Stage):
         else:
             self.log.warning("RTF UNMEASURED — the card will say so rather than claim a pass")
 
-        card = render_model_card(self.cfg, self._load_metrics(), latency)
+        card = render_model_card(self.cfg, self._load_metrics(), latency,
+                                 self._train_meta())
         self.out_path.write_text(card, encoding="utf-8")
         # also drop a copy in the top-level model_cards/ gallery
         gallery = Path("model_cards") / f"{self.cfg.run.name}.md"
@@ -296,6 +297,13 @@ class PackageStage(Stage):
             if base:
                 return base
         return get_base_model(self.cfg.train.base_model).hf_id
+
+    def _train_meta(self) -> dict:
+        """What training actually did. Empty when the run was never trained (a base
+        TTS voice is packageable), which the card then states rather than inventing."""
+        import json  # noqa: PLC0415
+        path = self.cfg.run_dir / "checkpoint" / "train_meta.json"
+        return json.loads(path.read_text()) if path.exists() else {}
 
     def _load_metrics(self) -> dict:
         m = self.cfg.run_dir / "metrics.json"
