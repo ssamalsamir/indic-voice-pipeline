@@ -41,12 +41,28 @@ corpus.** The full study is §5. The base voice is what ships.
 
 | Track | Artifact | RTF | p50 | p95 | Verdict |
 |---|---|---|---|---|---|
-| TTS (VITS) | torch, MPS | **0.061** | 503 ms | 984 ms | **PASS** |
-| STT | CTranslate2 int8, CPU | **1.691** | 6,870 ms | 8,562 ms | **FAIL** |
+| TTS (VITS) | torch, MPS | **0.062** | 492 ms | 898 ms | **PASS** |
+| STT, isolated ~4s clips | CTranslate2 int8, CPU | **1.555** | 6,576 ms | 7,259 ms | **FAIL** |
+| STT, 30s stream chunks | CTranslate2 int8, CPU | **0.623** | — | — | **PASS** |
 | STT (before export) | LoRA checkpoint, MPS | 4.472 | 18,841 ms | 23,457 ms | FAIL |
 
-Export bought **2.6x** and is the single largest latency win available in software.
-It is still short of the bar: see §6.
+Export bought **2.9x** on the per-clip figure and is the single largest latency win
+available in software.
+
+**The two STT rows differ by 2.5x and both are real.** Whisper's encoder always runs a
+fixed 30s window, so a 4s clip costs nearly what a 30s clip costs: isolated short clips
+spend most of their time encoding padding. Fed 30s chunks — how a streaming service
+actually runs — the same model reaches 0.623 and clears the bar.
+
+The gate deliberately uses the worse per-clip number. It is the plain definition, it
+matches how the eval set is scored, and a gate should never be the flattering choice of
+two. So the honest verdict is: **fails as a single-shot API on short utterances, passes
+as a streaming service**, and §6 says what would close the gap outright.
+
+One caveat learned the hard way: RTF must be measured on an idle machine. An earlier run
+of this exact code reported the stream figure as 2.07 — *slower* than per-clip, which
+inverted the conclusion — because a training job was saturating the CPU. Both numbers
+above were reproduced twice on an idle box (1.549/0.634 and 1.555/0.623).
 
 ### Does the quantised artifact keep its accuracy?
 
@@ -186,20 +202,23 @@ seeded.
 
 ## 6. Honest gaps
 
-**STT does not meet the RTF bar.** 1.691 against 1.0, after export improved it 2.6x
-from 4.472. This is the only bar still failed. What is left is not software:
-whisper-large-v2 int8 on four performance cores is ~1.7x real time, and CTranslate2 has
-no Metal backend so the GPU on this machine is unavailable to it. Closing it means a
+**STT misses the RTF bar on short single-shot requests.** 1.555 against 1.0, after
+export improved it 2.9x from 4.472. Streaming clears the bar at 0.623, so this is a
+request-shape problem rather than a model-too-slow problem. Closing it outright means a
 smaller model (whisper-medium is ~2.5x faster, at a WER cost this project has already
-measured: 0.2893 vs 0.0675) or a GPU serving box. Thread tuning was measured and is
-nearly exhausted: 8 threads beat the default by 12%, and 10 threads were 25% *worse*
-because work spills onto efficiency cores.
+measured: 0.2893 vs 0.0675) or a GPU serving box — CTranslate2 has no Metal backend, so
+the GPU on this machine is unavailable to it. Thread tuning is nearly exhausted: 8
+threads beat the default by 12%, and 10 threads were 25% *worse* because work spills
+onto efficiency cores.
 
-**A discarded assumption, kept because it was wrong.** I expected Whisper's fixed 30s
-encoder window to mean short clips mostly pay for padding, so serving 30s chunks would
-be far cheaper per second of audio. Measured, streaming is *slower* (2.07 vs 1.69):
-decode is autoregressive and a 30s chunk carries ~8x the tokens. Both numbers are in
-`latency.json` rather than only the flattering one.
+**A measurement I got wrong, and how.** I predicted the fixed 30s encoder window would
+make streaming much cheaper per second of audio, then measured streaming as *slower*
+(2.07 vs 1.69) and wrote the prediction off as falsified. It was the measurement that
+was wrong: a VITS training job was saturating the CPU during that run. Re-measured
+twice on an idle machine, streaming is 2.5x cheaper exactly as predicted. The lesson is
+narrow and worth keeping — a timing metric taken while anything else is running is not
+a timing metric, and contention can move a number in whichever direction happens to
+flip your conclusion.
 
 **MCD not computed.** Reported as `null` with a stated reason rather than a fabricated
 number.
@@ -229,10 +248,12 @@ the comparison trustworthy, but the diagnosis was wrong and only the control sho
 
 ## 7. Next improvements, ranked
 
-1. **Close the STT RTF gap**, the only failed bar. Either serve whisper-medium
-   fine-tuned on Kathbath (the accuracy headroom between 0.0675 and the 0.10 bar may
-   absorb the loss — untested, and the cheapest experiment left) or move serving to a
-   GPU box where the fp16 checkpoint already runs comfortably.
+1. **Close the STT RTF gap for short requests**, the only failed bar. Cheapest first:
+   batch concurrent short requests into one 30s encoder window, which is the same
+   mechanism that already gets streaming to 0.623 and needs no retraining. Failing
+   that, fine-tune whisper-medium on Kathbath (the headroom between 0.0675 and the 0.10
+   bar may absorb the accuracy loss — untested, and the cheapest experiment left) or
+   move serving to a GPU box.
 2. **More TTS data before more TTS training.** §5 shows the training code works and the
    corpus is the binding constraint. A single-speaker corpus of a few thousand
    utterances would make fine-tuning meaningful; 100 multi-speaker clips cannot.

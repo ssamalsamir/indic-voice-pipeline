@@ -128,17 +128,23 @@ class PackageStage(Stage):
         rtf_clip = (sum(latencies) / 1000) / audio_s
         stream = self._stream_rtf(run_once, rows) if is_stt else None
 
-        # Both numbers are kept because the cheap assumption about Whisper is wrong.
-        # Whisper's encoder does run a fixed 30s window, which suggests short clips
-        # merely pay for padding and that batching to 30s would be far cheaper per
-        # second of audio. Measured, it is the other way round: streaming 30s chunks
-        # came out SLOWER per second (2.07) than 4s clips (1.69), because decoding is
-        # autoregressive and a 30s chunk carries ~8x the tokens. Encoder padding is
-        # not the bottleneck; decode is.
+        # Both numbers are kept because they differ by 2.5x and mean different things.
+        # Whisper's encoder always runs a fixed 30s window, so a 4s clip pays almost
+        # the same wall time as a 30s one. Measured on an idle machine, twice:
         #
-        # So the gate uses the per-clip figure — the plain definition, and the one
-        # matching how the eval set is scored — and the stream figure rides along as
-        # evidence rather than being quietly dropped for being inconvenient.
+        #   isolated ~4s clips   RTF 1.55   (mostly encoding padding)
+        #   30s chunks           RTF 0.62   (the throughput a stream actually gets)
+        #
+        # The gate deliberately uses the WORSE per-clip figure. It is the plain
+        # definition, it matches how the eval set is scored, and a gate should never
+        # be the flattering measurement of the two. The stream number is recorded
+        # beside it because it is the one that describes a deployed service.
+        #
+        # Measure this on an idle box. An earlier run of this same code reported the
+        # stream figure as 2.07 — slower than per-clip, which inverted the conclusion —
+        # because a training job was saturating the CPU at the time. RTF is a timing
+        # measurement and contention silently corrupts it in whichever direction the
+        # contention happens to land.
         rtf = rtf_clip
         out = {
             "hardware": self._runtime,
