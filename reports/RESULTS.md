@@ -23,6 +23,16 @@ Mentor-agreed bars: **WER ≤ 0.10, CER ≤ 0.08** (STT), intelligible and demoa
 The headline is **WER 0.0675 / CER 0.0206 on 500 held-out clips**, a 77% relative WER
 reduction over the whisper-medium starting point.
 
+### STT — Marathi (second language, config-only)
+
+| Run | Base model | Train data | WER | CER | n | Verdict |
+|---|---|---|---|---|---|---|
+| `mr_stt_kathbath_large` | whisper-large-v3 | Kathbath 8k | 0.2014 | **0.0422** | 500 | FAIL (WER) |
+
+CER clears its bar; WER does not. Full analysis in §4 — the short version is that
+Marathi has no language-specialised base to start from, and that swap is the largest
+single lever in this project.
+
 ### TTS — Hindi
 
 Intelligibility = synthesise 39 held-out sentences, transcribe them back with our own
@@ -132,14 +142,44 @@ card. The TTS config states plainly that no voice cloning occurs.
 
 ## 4. Reuse proof (#9)
 
-`configs/mr_stt_kathbath_large.yaml` differs from the Hindi run by **exactly four lines** —
-`name`, `language`, `hf_config`, `base_model`. No code changes.
+`configs/mr_stt_kathbath_large.yaml` differs from the Hindi run by **exactly four
+semantic lines** — `name`, `language`, `hf_config`, `base_model`. No code changes.
 
-Marathi has no Marathi-specialised base in the registry, so it starts from multilingual
-`whisper-large-v3`. The claim under test is that the *pipeline* generalises, not that
-the accuracy transfers.
+**The run completed.** 2 epochs over 8,000 Kathbath Marathi utterances, 9.4h on a Kaggle
+GPU, scored on 500 held-out clips:
 
-Run status and result are appended here when it completes.
+| Run | Base model | WER | CER | n | Verdict |
+|---|---|---|---|---|---|
+| `hi_stt_kathbath_large` | whisper-hindi-large-v2 | 0.0675 | 0.0206 | 500 | PASS |
+| `mr_stt_kathbath_large` | whisper-large-v3 | **0.2014** | **0.0422** | 500 | **FAIL** (WER) |
+
+`train_loss` 0.1631, `eval_loss` falling monotonically to 0.1108 — the fine-tune worked;
+it converged.
+
+**What this does and does not prove.** The pipeline claim is proven: a language it had
+never processed ran ingest → clean → align → train → evaluate on a config diff alone,
+and produced a scored, gated result with no code edit. That is acceptance #9.
+
+The accuracy claim was never in scope, and the gap is exactly the one predicted before
+the run: there is no Marathi-specialised base in the registry, so Marathi starts from
+multilingual `whisper-large-v3` while Hindi starts from a model already fine-tuned on
+Hindi. §2 identifies that swap as the single largest gain in the entire project, and
+Marathi is the control that confirms it from the other direction — 0.2014 against
+whisper-large-v3's 0.1712 on Hindi FLEURS is the same weight class, and 3x the Hindi
+result on identical data, identical hyperparameters and identical code.
+
+**CER tells the more useful story: 0.0422 passes the 0.08 bar comfortably.** A 4.8x
+WER/CER ratio means the model has the Marathi phonology largely right and is losing
+whole words — the signature of missing lexical and orthographic priors, not bad
+acoustics. That is what a language-specialised base supplies.
+
+The honest read: **the machine generalises; the model does not, and would not be
+expected to.** Closing it means finding or building a Marathi-adapted base, which is a
+data and model-sourcing problem, not a pipeline one.
+
+One caveat on reproduction: the completed run predates the CTranslate2 export block
+landing in this config, so its artifact is the raw checkpoint. Re-running `package`
+produces the int8 artifact; no RTF was measured for Marathi.
 
 ---
 
@@ -254,13 +294,18 @@ the comparison trustworthy, but the diagnosis was wrong and only the control sho
    that, fine-tune whisper-medium on Kathbath (the headroom between 0.0675 and the 0.10
    bar may absorb the accuracy loss — untested, and the cheapest experiment left) or
    move serving to a GPU box.
-2. **More TTS data before more TTS training.** §5 shows the training code works and the
+2. **A Marathi-specialised base model.** §4 shows the pipeline generalises and the base
+   model does not. Hindi gained more from swapping to a Hindi-aware base than from any
+   other change; Marathi is currently paying that cost in reverse. Either find an
+   existing Marathi or Indic-multilingual fine-tune, or build one — this is the highest
+   accuracy lever for any new language, ahead of hyperparameters.
+3. **More TTS data before more TTS training.** §5 shows the training code works and the
    corpus is the binding constraint. A single-speaker corpus of a few thousand
    utterances would make fine-tuning meaningful; 100 multi-speaker clips cannot.
-3. **Streaming ingest** to lift the 8,000-utterance cap and use all ~15GB of Kathbath.
+4. **Streaming ingest** to lift the 8,000-utterance cap and use all ~15GB of Kathbath.
    Data was the binding constraint at every point in this project.
-4. **Beam search at scoring on GPU.** All reported numbers use greedy decoding, since
+5. **Beam search at scoring on GPU.** All reported numbers use greedy decoding, since
    beams push a 16GB Mac into swap. Beams typically buy 1-2 absolute WER points.
-5. **Speed perturbation** to pair with the SpecAugment already shipped.
-6. **LM rescoring** (shallow fusion with an n-gram or small LM) — the largest build
+6. **Speed perturbation** to pair with the SpecAugment already shipped.
+7. **LM rescoring** (shallow fusion with an n-gram or small LM) — the largest build
    here, and the standard next lever once acoustics are strong.

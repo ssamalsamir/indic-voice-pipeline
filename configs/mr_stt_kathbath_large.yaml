@@ -64,6 +64,9 @@ eval:
     cer: 0.08
 
 package:
-  quantise: false
-  serve_format: torch
+  # Same on-prem export as the Hindi run. NOTE: the completed Marathi run predates
+  # this block landing, so its artifact is the raw checkpoint; re-run `package` to
+  # produce the int8 CTranslate2 artifact.
+  quantise: true
+  serve_format: ctranslate2
   rtf_target: 1.0
