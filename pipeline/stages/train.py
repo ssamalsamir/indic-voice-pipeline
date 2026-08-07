@@ -259,11 +259,21 @@ class TrainStage(Stage):
         # predict what the audio side already encodes, and leave the vocoder alone.
         prior_only = bool(getattr(tc, "freeze_vocoder", False))
         if prior_only:
-            for module in (model.decoder, model.posterior_encoder):
+            # The FLOW is frozen too, and that is the subtle part. The flow sits on the
+            # POSTERIOR side of the KL term (z_p = flow(z)), so with the decoder frozen
+            # there is no reconstruction loss anchoring z_p to anything. A trainable
+            # flow can then drive KL down by collapsing information out of z_p instead
+            # of by moving the prior toward the audio — a degenerate optimum that
+            # full VITS never reaches because the same latents feed a mel loss.
+            # Measured: leaving the flow trainable produced well-formed speech at
+            # correct amplitude and duration that said the WRONG WORDS (0.94 WER).
+            # What is left trainable is exactly the text side: text encoder and
+            # duration predictor, scored against a fixed target.
+            for module in (model.decoder, model.posterior_encoder, model.flow):
                 for p in module.parameters():
                     p.requires_grad_(False)
-            self.log.info("freeze_vocoder=true — adapting prior side only "
-                          "(no discriminator, no adversarial or mel loss)")
+            self.log.info("freeze_vocoder=true — adapting text encoder + duration "
+                          "predictor only (decoder, posterior encoder and flow frozen)")
 
         disc = None if prior_only else VitsDiscriminator().to(dev).train()
         opt_g = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],

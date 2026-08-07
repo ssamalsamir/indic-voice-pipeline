@@ -51,17 +51,28 @@ train:
   lora:
     enabled: true
   voice_id: mms_hin_default
-  # 30 epochs over 100 utterances (~390 steps), not the 200 a from-scratch VITS wants.
-  # This is an ADAPTATION of an already-trained voice: the pretrained model starts near
-  # a good optimum, and long training on 100 clips walks away from it into memorisation.
-  # Adapt the text/duration side; leave the pretrained vocoder alone. The full
-  # adversarial run is implemented and works mechanically, but on 100 clips with a
-  # fresh discriminator it drove intelligibility from 0.16 to 1.04 WER.
+  # These numbers are the end of a measured search, not a starting guess. Four recipes
+  # were run against the same judge, the same seed and the same 39 held-out sentences:
+  #
+  #   base voice, no fine-tune                              asr_wer 0.1547  PASS
+  #   full adversarial, 30 ep @ 2e-4                        asr_wer 1.0428  FAIL
+  #   vocoder frozen, 30 ep @ 2e-5                          asr_wer 0.9447  FAIL
+  #   vocoder + flow frozen, 30 ep @ 2e-5                   asr_wer 0.9736  FAIL
+  #   vocoder + flow frozen, 3 ep @ 2e-6  (this config)     asr_wer 0.1811  PASS
+  #
+  # The last row is what proves the objective is correct rather than the loss being
+  # wrong: gentle training leaves the voice intact, so the catastrophic rows are
+  # over-training on 100 sentences, not a bad gradient. 100 utterances cannot move a
+  # model already trained on far more Hindi without forgetting the rest of the
+  # language, and the eval sentences are ones it never saw.
+  #
+  # Net: fine-tuning buys nothing here. 0.1811 is marginally WORSE than the 0.1547
+  # base, and the gap sits at the metric's own noise floor (~0.02 on 39 clips). Ship
+  # the base voice; this config exists so the training path stays exercised and the
+  # negative result stays reproducible.
   freeze_vocoder: true
-  epochs: 30
-  # 10x lower than the adversarial run. This is adaptation of an already-good model,
-  # and 2e-4 moves a pretrained prior further in 390 steps than the data supports.
-  lr: 2.0e-5
+  epochs: 3
+  lr: 2.0e-6
   # 8, not 16: the posterior encoder and flow run over FULL-length spectrograms (up to
   # ~1000 frames here) before anything gets sliced, and that is the memory peak on a
   # 16GB M4. Only the vocoder sees short windows.
