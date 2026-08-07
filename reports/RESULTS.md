@@ -48,6 +48,26 @@ corpus.** The full study is §5. The base voice is what ships.
 Export bought **2.6x** and is the single largest latency win available in software.
 It is still short of the bar: see §6.
 
+### Does the quantised artifact keep its accuracy?
+
+Worth asking, because the headline WER was measured on the fp32 LoRA checkpoint while
+what ships is a merged int8 model. A quantised artifact whose accuracy was never checked
+is the same class of gap as a latency figure for a model nobody deploys.
+
+| Artifact | WER | CER | n |
+|---|---|---|---|
+| fp32 LoRA checkpoint (headline) | 0.0675 | 0.0206 | 500 |
+| CTranslate2 int8 (shipped) | 0.0751 | 0.0241 | 200 |
+
+Not a strict like-for-like: the int8 run covers the first 200 clips of the same held-out
+manifest, not all 500, so part of the 0.008 gap is subset composition rather than
+precision. The useful conclusion is the negative one — int8 does not cost anything
+close to the 0.10 bar's headroom, and the shipped model still passes. A clean A/B on
+identical clips is one command and has not been run.
+
+Independent corroboration from the TTS track, where int8 and fp32 judged the *same*
+synthesised audio: 0.1547 vs 0.161. Quantisation cost the judge nothing measurable.
+
 ---
 
 ## 2. Design
