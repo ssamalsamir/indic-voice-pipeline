@@ -80,19 +80,24 @@ Worth asking, because the headline WER was measured on the fp32 LoRA checkpoint 
 what ships is a merged int8 model. A quantised artifact whose accuracy was never checked
 is the same class of gap as a latency figure for a model nobody deploys.
 
-| Artifact | WER | CER | n |
-|---|---|---|---|
-| fp32 LoRA checkpoint (headline) | 0.0675 | 0.0206 | 500 |
-| CTranslate2 int8 (shipped) | 0.0751 | 0.0241 | 200 |
+| Artifact | WER | CER | n | Verdict |
+|---|---|---|---|---|
+| fp32 LoRA checkpoint (headline) | 0.0675 | 0.0206 | 500 | PASS |
+| **CTranslate2 int8 (shipped)** | **0.0683** | **0.0208** | 500 | **PASS** |
 
-Not a strict like-for-like: the int8 run covers the first 200 clips of the same held-out
-manifest, not all 500, so part of the 0.008 gap is subset composition rather than
-precision. The useful conclusion is the negative one — int8 does not cost anything
-close to the 0.10 bar's headroom, and the shipped model still passes. A clean A/B on
-identical clips is one command and has not been run.
+Same 500 clips, same normaliser, same greedy decoding — only the precision differs.
+**Quantisation costs 0.0008 WER**, which is nothing against a 0.10 bar. The shipped
+artifact passes on its own measurement rather than by inference from the checkpoint's.
+
+A note on stopping early. An interim run over the first 200 clips read 0.0751, and the
+tempting read was "int8 costs ~0.008 WER". The right read was that a 200-clip prefix is
+not the 500-clip set, so most of that gap was probably subset composition. It was: at
+full n the gap is 10x smaller. A partial-set number is not a small-sample version of the
+full-set number, it is a different measurement.
 
 Independent corroboration from the TTS track, where int8 and fp32 judged the *same*
-synthesised audio: 0.1547 vs 0.161. Quantisation cost the judge nothing measurable.
+synthesised audio: 0.1547 vs 0.161. Quantisation cost the judge nothing measurable
+there either.
 
 ---
 
