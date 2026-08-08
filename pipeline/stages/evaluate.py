@@ -186,7 +186,7 @@ class EvaluateStage(Stage):
         judge = self._asr_judge()
         out_dir = self.cfg.run_dir / "tts_audio"
 
-        pairs, rows = [], []
+        pairs, rows, mcds = [], [], []
         for i, row in enumerate(read_jsonl(self._ensure_eval_manifest())):
             ref = row["text"]
             if not ref.strip():
@@ -194,8 +194,11 @@ class EvaluateStage(Stage):
             wav, dur = synth.to_wav(ref, out_dir / f"tts_{i:05d}.wav")
             hyp = self._norm(judge.transcribe(str(wav), synth.sampling_rate, num_beams=1))
             pairs.append((self._norm(ref), hyp))
+            mcd = self._mcd(row.get("audio_path"), wav, synth.sampling_rate)
+            if mcd is not None:
+                mcds.append(mcd)
             rows.append({"id": row.get("id", i), "text": ref, "asr": hyp,
-                         "wav": str(wav), "duration_s": round(dur, 3)})
+                         "wav": str(wav), "duration_s": round(dur, 3), "mcd": mcd})
 
         if not pairs:
             raise ValueError("no usable held-out text to synthesise")
@@ -211,12 +214,43 @@ class EvaluateStage(Stage):
             "synth_seed": self.cfg.run.seed,
             "by_slice": {},
         }
-        # MCD needs reference audio AND a spectral lib; say so rather than emit a number
-        # that was never computed — a fabricated metric is worse than a declared gap.
+        # Reported under its own name, NOT as `mcd`. Two independent reasons, either
+        # alone sufficient: it is computed from MFCCs rather than mel-cepstral
+        # coefficients so it sits ~20x above the published MCD scale, and the reference
+        # is a DIFFERENT speaker from the synthesised voice so it carries timbre
+        # distance as well as pronunciation. Calling it `mcd` would invite comparison
+        # against literature figures of 4-10 and mislead on both counts.
+        if mcds:
+            report["spectral_distance_mfcc"] = round(sum(mcds) / len(mcds), 3)
+            report["spectral_distance_n"] = len(mcds)
+        else:
+            report["spectral_distance_mfcc"] = None
         report["mcd"] = None
-        report["mcd_note"] = ("not computed: requires reference audio aligned to the "
-                              "synthesised text plus librosa; see PLAN.md Wk5-6")
+        report["mcd_note"] = (
+            "true MCD needs mel-cepstral (mgcep/SPTK) analysis, a dependency this "
+            "project does not carry; spectral_distance_mfcc is an MFCC-based proxy on "
+            "a different scale, and is cross-speaker, so use it to compare runs here "
+            "rather than against published MCD"
+        )
         return report
+
+    def _mcd(self, ref_path, syn_path, sr: int):
+        """MCD for one pair, or None when the reference audio is unavailable.
+
+        Never fatal: a missing or unreadable reference clip costs one data point, and
+        killing a completed synthesis run over a secondary metric would be the wrong
+        trade.
+        """
+        if not ref_path or not Path(ref_path).exists():
+            return None
+        try:
+            from pipeline.data import load_audio  # noqa: PLC0415
+            from pipeline.mcd import spectral_distance  # noqa: PLC0415
+            return round(spectral_distance(
+                load_audio(str(ref_path), sr), load_audio(str(syn_path), sr), sr), 3)
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning("MCD failed for %s (%s)", ref_path, exc)
+            return None
 
     def _asr_judge(self):
         """The STT model that scores intelligibility. Config-named, never guessed."""
