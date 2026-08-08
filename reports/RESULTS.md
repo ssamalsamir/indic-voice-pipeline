@@ -44,6 +44,10 @@ of sentences, so they are directly comparable.
 | **Released `facebook/mms-tts-hin`, no fine-tune (shipped)** | **0.1547** | 0.0768 | **PASS** |
 | Fine-tuned, 3 epochs @ 2e-6, vocoder + flow frozen | 0.1811 | 0.0872 | PASS |
 
+An objective spectral distance to the reference recordings is also computed
+(`spectral_distance_mfcc` = 103.2 over 39 clips). It is deliberately not reported as
+MCD — see §6 for why that distinction matters.
+
 **Fine-tuning was implemented, run four ways, and measurably does not help on this
 corpus.** The full study is §5. The base voice is what ships.
 
@@ -265,8 +269,29 @@ narrow and worth keeping — a timing metric taken while anything else is runnin
 a timing metric, and contention can move a number in whichever direction happens to
 flip your conclusion.
 
-**MCD not computed.** Reported as `null` with a stated reason rather than a fabricated
-number.
+**MCD still reported as `null`, now with a sharper reason.** An objective spectral
+distance *is* computed — MFCC cepstra, DTW-aligned, c0 excluded, RMS normalised — and
+ships as `spectral_distance_mfcc` (103.2 over 39 clips). It is not called MCD, for two
+independent reasons either of which would be enough:
+
+1. True MCD is defined over mel-cepstral coefficients from mgcep/SPTK analysis, whose
+   magnitudes are ~0.1-1. The `10/ln(10)*sqrt(2)` constant is what maps *those* into dB,
+   which is why published MCD figures land around 4-10. MFCC magnitudes are ~5-20, so
+   the identical formula over MFCCs sits roughly 20x higher. The first implementation
+   printed 441 and the second 141 — both were arithmetically fine and neither was an MCD.
+2. The reference is a *different speaker* from the synthesised voice, so the number
+   carries timbre distance as much as pronunciation.
+
+Publishing 103 under the name `mcd` would invite comparison against literature values
+and mislead on both counts. Getting a real MCD means adding mel-cepstral analysis
+(pysptk) — a dependency, not a rename.
+
+Two things the unit tests caught while building it, both of which produce plausible
+wrong numbers rather than errors: without DTW alignment a tempo difference reads as a
+timbre error, and switching to natural-log mels silently broke gain invariance, because
+torchaudio's `log(mel + 1e-6)` floor leaks level into c1..c12 for quiet bins — halving
+the input gain moved the score by 27. RMS-normalising first makes that invariance
+structural rather than assumed.
 
 **Small eval samples.** The TTS figures rest on 39 clips, where the noise floor is
 ~0.02 WER. Only the 0.0675 STT headline uses 500.
